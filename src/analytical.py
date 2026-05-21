@@ -3,11 +3,11 @@ import jax.numpy as jnp
 
 # Analytical solutions for benchmarking:
 def taylor_green_u(x, y, t, nu):
-    return -jnp.cos(x) * jnp.sin(y) * jnp.exp(-2 * nu * t)
+    return jnp.cos(x) * jnp.sin(y) * jnp.exp(-2 * nu * t)
 
 
 def taylor_green_v(x, y, t, nu):
-    return jnp.sin(x) * jnp.cos(y) * jnp.exp(-2 * nu * t)
+    return -jnp.sin(x) * jnp.cos(y) * jnp.exp(-2 * nu * t)
 
 
 def taylor_green_p(x, y, t, nu):
