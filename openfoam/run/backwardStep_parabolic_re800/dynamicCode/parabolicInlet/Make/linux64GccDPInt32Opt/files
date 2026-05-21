@@ -1,0 +1,6 @@
+# dynamicCode:
+# SHA1 = fec44b96033fd1a268374e18b7036ced509664f4
+
+SOURCE += codedFixedValueFvPatchFieldTemplate.C
+
+LIB = $(PWD)/../platforms/$(WM_OPTIONS)/lib/libparabolicInlet_fec44b96033fd1a268374e18b7036ced509664f4

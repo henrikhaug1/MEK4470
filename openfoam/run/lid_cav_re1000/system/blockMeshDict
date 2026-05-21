@@ -1,0 +1,91 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Website:  https://openfoam.org                  |
+|   \\  /    A nd           | Version:  11                                    |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+
+convertToMeters 1.0;
+
+// Domain: Omega = [-1, 1]^2
+xmin   -1.0;
+xmax    1.0;
+ymin   -1.0;
+ymax    1.0;
+
+// Thin extrusion for 2D
+Z       0.1;
+
+// Mesh resolution (choose what you want)
+Nx      100;
+Ny      100;
+
+vertices
+(
+    ($xmin $ymin 0)    // 0
+    ($xmax $ymin 0)    // 1
+    ($xmax $ymax 0)    // 2
+    ($xmin $ymax 0)    // 3
+
+    ($xmin $ymin $Z)   // 4
+    ($xmax $ymin $Z)   // 5
+    ($xmax $ymax $Z)   // 6
+    ($xmin $ymax $Z)   // 7
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) ($Nx $Ny 1) simpleGrading (1 1 1)
+);
+
+edges
+(
+);
+
+boundary
+(
+    // Top lid: y = ymax
+    movingWall
+    {
+        type wall;
+        faces
+        (
+            (3 2 6 7)
+        );
+    }
+
+    // Bottom wall: y = ymin
+    fixedWalls
+    {
+        type wall;
+        faces
+        (
+            (0 1 5 4)   // bottom
+            (0 3 7 4)   // left
+            (1 2 6 5)   // right
+        );
+    }
+
+    // 2D: front/back are empty
+    frontAndBack
+    {
+        type empty;
+        faces
+        (
+            (0 1 2 3)
+            (4 5 6 7)
+        );
+    }
+);
+
+mergePatchPairs
+(
+);

@@ -1,0 +1,93 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  11
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+convertToMeters 0.1;
+
+H       1.0;
+twoH    2.0;
+Lin     2.0;
+Ltotal  42.0;
+Z       0.1;
+
+vertices
+(
+    (0       $H      0)    // 0
+    ($Lin    $H      0)    // 1
+    ($Lin    0       0)    // 2
+    ($Ltotal 0       0)    // 3
+    ($Ltotal $H      0)    // 4
+    ($Ltotal $twoH   0)    // 5
+    ($Lin    $twoH   0)    // 6
+    (0       $twoH   0)    // 7
+
+    (0       $H      $Z)   // 8
+    ($Lin    $H      $Z)   // 9
+    ($Lin    0       $Z)   // 10
+    ($Ltotal 0       $Z)   // 11
+    ($Ltotal $H      $Z)   // 12
+    ($Ltotal $twoH   $Z)   // 13
+    ($Lin    $twoH   $Z)   // 14
+    (0       $twoH   $Z)   // 15
+);
+
+blocks
+(
+    // Inlet block
+    hex (0 1 6 7 8 9 14 15) (20 20 1) simpleGrading (1 1 1)
+    // Outlet/Expansion block
+    hex (1 4 5 6 9 12 13 14) (400 20 1) simpleGrading (1 1 1)
+    // Lower block (the step region)
+    hex (2 3 4 1 10 11 12 9) (400 20 1) simpleGrading (1 1 1)
+);
+
+edges
+(
+);
+
+boundary
+(
+    inlet
+    {
+        type patch;
+        faces ((0 8 15 7));
+    }
+    outlet
+    {
+        type patch;
+        faces ((3 11 12 4) (4 12 13 5));
+    }
+    walls
+    {
+        type wall;
+        faces
+        (
+            (0 1 9 8)    // Inlet bottom
+            (1 2 10 9)   // THE STEP FACE
+            (2 3 11 10)  // Expansion bottom
+            (7 15 14 6)  // Inlet top
+            (6 14 13 5)  // Expansion top
+        );
+    }
+    frontAndBack
+    {
+        type empty;
+        faces
+        (
+            (0 7 6 1) (8 9 14 15)
+            (1 6 5 4) (9 12 13 14)
+            (2 1 4 3) (10 11 12 9)
+        );
+    }
+);
