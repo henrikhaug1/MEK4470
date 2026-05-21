@@ -178,6 +178,66 @@ def eval_uvp_batch_bs(model, x, y, x_min, x_max, H, h_step=1.0, u_mean=1.0):
 
 
 # =========================================================
+# backward-facing step — raw output (no ansatz, for soft-BC training)
+# =========================================================
+
+
+def eval_uvp_batch_bs_raw(model, x, y, x_min, x_max, H):
+    def eval_single(xi, yi):
+        x_n, y_n = normalize_xy(xi, yi, x_min, x_max, H)
+        raw = model(jnp.stack([x_n, y_n])[None])[0]
+        return raw[0], raw[1], raw[2]
+
+    return jax.vmap(eval_single)(x, y)
+
+
+def dudx_at_outlet_bs_raw(model, x, y, x_min, x_max, H):
+    ex = jnp.array([1.0, 0.0])
+    xy_batch = jnp.stack([x, y], axis=-1)
+
+    def single(xy):
+        def net_fn(z):
+            x_n, y_n = normalize_xy(z[0], z[1], x_min, x_max, H)
+            return model(jnp.stack([x_n, y_n])[None])[0]
+
+        _, d_x = jax.jvp(net_fn, (xy,), (ex,))
+        return d_x[0], d_x[1]
+
+    return jax.vmap(single)(xy_batch)
+
+
+def residuals_batch_bs_raw(model, Re, x, y, x_min, x_max, H):
+    nu = 1.0 / Re
+    ex = jnp.array([1.0, 0.0])
+    ey = jnp.array([0.0, 1.0])
+    xy_batch = jnp.stack([x, y], axis=-1)
+
+    def residual_single(xy):
+        def net_fn(z):
+            x_n, y_n = normalize_xy(z[0], z[1], x_min, x_max, H)
+            return model(jnp.stack([x_n, y_n])[None])[0]
+
+        out, d_x = jax.jvp(net_fn, (xy,), (ex,))
+        _, d_y = jax.jvp(net_fn, (xy,), (ey,))
+
+        u, v, p = out[0], out[1], out[2]
+        ux, vx, px = d_x[0], d_x[1], d_x[2]
+        uy, vy, py = d_y[0], d_y[1], d_y[2]
+
+        _, d_xx = jax.jvp(lambda z: jax.jvp(net_fn, (z,), (ex,))[1], (xy,), (ex,))
+        _, d_yy = jax.jvp(lambda z: jax.jvp(net_fn, (z,), (ey,))[1], (xy,), (ey,))
+        u_xx, v_xx = d_xx[0], d_xx[1]
+        u_yy, v_yy = d_yy[0], d_yy[1]
+
+        continuity = ux + vy
+        mom_x = u * ux + v * uy + px - nu * (u_xx + u_yy)
+        mom_y = u * vx + v * vy + py - nu * (v_xx + v_yy)
+        return continuity, mom_x, mom_y
+
+    return jax.vmap(residual_single)(xy_batch)
+
+
+# =========================================================
 # backward-facing step — samplers
 # =========================================================
 

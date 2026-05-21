@@ -12,7 +12,7 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.pinn import BackwardStepPINN, load_model_state, eval_uvp_batch_bs
+from src.pinn import BackwardStepPINN, load_model_state, eval_uvp_batch_bs_raw
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -100,16 +100,14 @@ RE_X_MAX = {100: 20.0, 200: 20.0, 400: 25.0}
 
 
 def eval_pinn(model, x_arr, y_arr, x_max=X_MAX):
-    """Evaluate PINN at arrays of (x, y) coordinates."""
-    u, v, p = eval_uvp_batch_bs(
+    """Evaluate PINN (raw output, no ansatz) at arrays of (x, y) coordinates."""
+    u, v, p = eval_uvp_batch_bs_raw(
         model,
         jnp.array(x_arr, dtype=float),
         jnp.array(y_arr, dtype=float),
         X_MIN,
         x_max,
         H_CHAN,
-        H_STEP,
-        U_MEAN,
     )
     return np.array(u), np.array(v), np.array(p)
 

@@ -14,8 +14,9 @@ from src.pinn import (
     BackwardStepPINN,
     lbfgs_step,
     save_model,
-    eval_uvp_batch_bs,
-    residuals_batch_bs,
+    eval_uvp_batch_bs_raw,
+    residuals_batch_bs_raw,
+    dudx_at_outlet_bs_raw,
 )
 
 from src.plotting import plot_backward_step, plot_loss, plot_recirculation
@@ -38,23 +39,33 @@ U_MEAN = 1.0
 # ============================================================
 
 
+WIDTHS = [128, 128, 128, 128]
+N_COL = 12000
+N_BC = 1000
+ADAM_EPOCHS = 10000
+LBFGS_STEPS = 8000
+LR_START = 1e-3
+LR_END = 1e-5
+
+
 def get_config(Re):
     x_r_est = 0.025 * Re
     x_max = max(20.0, x_r_est * 2.5)
     return dict(
         x_max=x_max,
-        widths=[32, 32, 32, 32],
-        n_col=5000,
-        adam_epochs=5000,
-        lr_start=1e-3,
-        lr_end=1e-5,
-        lbfgs_steps=5000,
+        widths=WIDTHS,
+        n_col=N_COL,
+        n_bc=N_BC,
+        adam_epochs=ADAM_EPOCHS,
+        lr_start=LR_START,
+        lr_end=LR_END,
+        lbfgs_steps=LBFGS_STEPS,
         x_recirc=min(x_r_est * 1.5, x_max),
     )
 
 
 # ============================================================
-# Re-adaptive samplers
+# Samplers
 # ============================================================
 
 
@@ -97,46 +108,160 @@ def sample_interior(key, n_col, x_max, x_recirc):
     )
 
 
+def sample_boundaries(key, n_per_seg, x_min, x_max, h_step, h_chan):
+    """Sample points on each of the 6 boundary segments."""
+    k1, k2, k3, k4, k5, k6 = jax.random.split(key, 6)
+
+    # Inlet: x = x_min, y in [h_step, h_chan]
+    x_in = jnp.full(n_per_seg, x_min)
+    y_in = jax.random.uniform(k1, (n_per_seg,)) * (h_chan - h_step) + h_step
+
+    # Top wall: y = h_chan, x in [x_min, x_max]
+    x_top = jax.random.uniform(k2, (n_per_seg,)) * (x_max - x_min) + x_min
+    y_top = jnp.full(n_per_seg, h_chan)
+
+    # Bottom wall: y = 0, x in [0, x_max]
+    x_bot = jax.random.uniform(k3, (n_per_seg,)) * x_max
+    y_bot = jnp.zeros(n_per_seg)
+
+    # Step top (upstream lower wall): y = h_step, x in [x_min, 0]
+    x_st = jax.random.uniform(k4, (n_per_seg,)) * abs(x_min) + x_min
+    y_st = jnp.full(n_per_seg, h_step)
+
+    # Step face: x = 0, y in [0, h_step]
+    x_sf = jnp.zeros(n_per_seg)
+    y_sf = jax.random.uniform(k5, (n_per_seg,)) * h_step
+
+    # Outlet: x = x_max, y in [0, h_chan]
+    x_out = jnp.full(n_per_seg, x_max)
+    y_out = jax.random.uniform(k6, (n_per_seg,)) * h_chan
+
+    return (
+        x_in,
+        y_in,
+        x_top,
+        y_top,
+        x_bot,
+        y_bot,
+        x_st,
+        y_st,
+        x_sf,
+        y_sf,
+        x_out,
+        y_out,
+    )
+
+
 # ============================================================
-# Loss
+# Loss with explicit boundary terms
 # ============================================================
 
 
-def make_loss_fn(model, Re, x_col, y_col, x_max):
-    W_P = 1.0
-    N_OUT = 200
-    x_outlet = jnp.full(N_OUT, x_max)
-    y_outlet = jnp.linspace(0.0, H_CHAN, N_OUT)
+def inlet_profile(y, h_step, h_chan, u_mean):
+    return u_mean * 6.0 * (y - h_step) * (h_chan - y) / (h_chan - h_step) ** 2
+
+
+W_PHYS = 10.0
+W_INLET = 10.0
+W_TOP = 10.0
+W_BOTTOM = 10.0
+W_STEP_TOP = 20.0
+W_STEP_FACE = 20.0
+W_OUTLET_P = 1.0
+W_OUTLET_GRAD = 5.0
+
+
+def make_loss_fn(Re, x_col, y_col, bc_pts, x_min, x_max):
+    (x_in, y_in, x_top, y_top, x_bot, y_bot, x_st, y_st, x_sf, y_sf, x_out, y_out) = (
+        bc_pts
+    )
+
+    u_inlet_ref = inlet_profile(y_in, H_STEP, H_CHAN, U_MEAN)
 
     def loss_fn(m):
-        cont, mom_x, mom_y = residuals_batch_bs(
+        cont, mom_x, mom_y = residuals_batch_bs_raw(
             m,
             Re,
             x_col,
             y_col,
-            X_MIN,
+            x_min,
             x_max,
             H_CHAN,
-            H_STEP,
-            U_MEAN,
         )
-        physics_loss = jnp.mean(cont**2) + jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
+        phys = jnp.mean(cont**2) + jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
 
-        _, _, p_out = eval_uvp_batch_bs(
-            m,
-            x_outlet,
-            y_outlet,
-            X_MIN,
-            x_max,
-            H_CHAN,
-            H_STEP,
-            U_MEAN,
+        u_i, v_i, _ = eval_uvp_batch_bs_raw(m, x_in, y_in, x_min, x_max, H_CHAN)
+        loss_inlet = jnp.mean((u_i - u_inlet_ref) ** 2) + jnp.mean(v_i**2)
+
+        u_t, v_t, _ = eval_uvp_batch_bs_raw(m, x_top, y_top, x_min, x_max, H_CHAN)
+        u_b, v_b, _ = eval_uvp_batch_bs_raw(m, x_bot, y_bot, x_min, x_max, H_CHAN)
+        loss_top = jnp.mean(u_t**2 + v_t**2)
+        loss_bot = jnp.mean(u_b**2 + v_b**2)
+
+        u_st, v_st, _ = eval_uvp_batch_bs_raw(m, x_st, y_st, x_min, x_max, H_CHAN)
+        u_sf, v_sf, _ = eval_uvp_batch_bs_raw(m, x_sf, y_sf, x_min, x_max, H_CHAN)
+        loss_step_top = jnp.mean(u_st**2 + v_st**2)
+        loss_step_face = jnp.mean(u_sf**2 + v_sf**2)
+
+        _, _, p_o = eval_uvp_batch_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
+        loss_outlet_p = jnp.mean(p_o**2)
+
+        dudx_o, dvdx_o = dudx_at_outlet_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
+        loss_outlet_grad = jnp.mean(dudx_o**2) + jnp.mean(dvdx_o**2)
+
+        total = (
+            W_PHYS * phys
+            + W_INLET * loss_inlet
+            + W_TOP * loss_top
+            + W_BOTTOM * loss_bot
+            + W_STEP_TOP * loss_step_top
+            + W_STEP_FACE * loss_step_face
+            + W_OUTLET_P * loss_outlet_p
+            + W_OUTLET_GRAD * loss_outlet_grad
         )
-        outlet_loss = jnp.mean(p_out**2)
-
-        return physics_loss + W_P * outlet_loss
+        return total
 
     return loss_fn
+
+
+def make_diag_fn(Re, x_col, y_col, bc_pts, x_min, x_max):
+    """Return individual loss components for logging (not JIT-compiled)."""
+    (x_in, y_in, x_top, y_top, x_bot, y_bot, x_st, y_st, x_sf, y_sf, x_out, y_out) = (
+        bc_pts
+    )
+    u_inlet_ref = inlet_profile(y_in, H_STEP, H_CHAN, U_MEAN)
+
+    @jax.jit
+    def diag_fn(m):
+        cont, mom_x, mom_y = residuals_batch_bs_raw(
+            m,
+            Re,
+            x_col,
+            y_col,
+            x_min,
+            x_max,
+            H_CHAN,
+        )
+        phys = jnp.mean(cont**2) + jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
+
+        u_i, v_i, _ = eval_uvp_batch_bs_raw(m, x_in, y_in, x_min, x_max, H_CHAN)
+        loss_inlet = jnp.mean((u_i - u_inlet_ref) ** 2) + jnp.mean(v_i**2)
+
+        u_t, v_t, _ = eval_uvp_batch_bs_raw(m, x_top, y_top, x_min, x_max, H_CHAN)
+        u_b, v_b, _ = eval_uvp_batch_bs_raw(m, x_bot, y_bot, x_min, x_max, H_CHAN)
+        loss_walls = jnp.mean(u_t**2 + v_t**2) + jnp.mean(u_b**2 + v_b**2)
+
+        u_st, v_st, _ = eval_uvp_batch_bs_raw(m, x_st, y_st, x_min, x_max, H_CHAN)
+        u_sf, v_sf, _ = eval_uvp_batch_bs_raw(m, x_sf, y_sf, x_min, x_max, H_CHAN)
+        loss_step = jnp.mean(u_st**2 + v_st**2) + jnp.mean(u_sf**2 + v_sf**2)
+
+        _, _, p_o = eval_uvp_batch_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
+        dudx_o, dvdx_o = dudx_at_outlet_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
+        loss_outlet = jnp.mean(p_o**2) + jnp.mean(dudx_o**2) + jnp.mean(dvdx_o**2)
+
+        return phys, loss_inlet, loss_walls, loss_step, loss_outlet
+
+    return diag_fn
 
 
 # ============================================================
@@ -144,48 +269,48 @@ def make_loss_fn(model, Re, x_col, y_col, x_max):
 # ============================================================
 
 
-def check_bcs(model, x_max, n=200):
+def check_bcs(model, x_min, x_max, n=200):
+    def _rms(arr):
+        return float(jnp.sqrt(jnp.mean(arr**2)))
+
+    # Inlet
     y_in = jnp.linspace(H_STEP, H_CHAN, n)
-    x_in = jnp.full(n, X_MIN)
-    u_in, v_in, _ = eval_uvp_batch_bs(
-        model, x_in, y_in, X_MIN, x_max, H_CHAN, H_STEP, U_MEAN
-    )
-    u_ref = U_MEAN * 6.0 * (y_in - H_STEP) * (H_CHAN - y_in) / (H_CHAN - H_STEP) ** 2
-    inlet_u_err = float(jnp.sqrt(jnp.mean((u_in - u_ref) ** 2)))
-    inlet_v_err = float(jnp.sqrt(jnp.mean(v_in**2)))
+    x_in = jnp.full(n, x_min)
+    u_in, v_in, _ = eval_uvp_batch_bs_raw(model, x_in, y_in, x_min, x_max, H_CHAN)
+    u_ref = inlet_profile(y_in, H_STEP, H_CHAN, U_MEAN)
 
-    y_out = jnp.linspace(0.0, H_CHAN, n)
-    x_out = jnp.full(n, x_max)
-    _, _, p_out = eval_uvp_batch_bs(
-        model, x_out, y_out, X_MIN, x_max, H_CHAN, H_STEP, U_MEAN
-    )
-    outlet_p_err = float(jnp.sqrt(jnp.mean(p_out**2)))
+    # Top wall
+    x_top = jnp.linspace(x_min, x_max, n)
+    y_top = jnp.full(n, H_CHAN)
+    u_top, v_top, _ = eval_uvp_batch_bs_raw(model, x_top, y_top, x_min, x_max, H_CHAN)
 
+    # Bottom wall
     x_bot = jnp.linspace(0.0, x_max, n)
     y_bot = jnp.zeros(n)
-    u_bot, v_bot, _ = eval_uvp_batch_bs(
-        model, x_bot, y_bot, X_MIN, x_max, H_CHAN, H_STEP, U_MEAN
-    )
-    wall_u_err = float(jnp.sqrt(jnp.mean(u_bot**2)))
-    wall_v_err = float(jnp.sqrt(jnp.mean(v_bot**2)))
+    u_bot, v_bot, _ = eval_uvp_batch_bs_raw(model, x_bot, y_bot, x_min, x_max, H_CHAN)
 
-    y_step = jnp.linspace(0.0, H_STEP, n)
-    x_step = jnp.zeros(n)
-    u_step, v_step, _ = eval_uvp_batch_bs(
-        model, x_step, y_step, X_MIN, x_max, H_CHAN, H_STEP, U_MEAN
-    )
-    step_u_err = float(jnp.sqrt(jnp.mean(u_step**2)))
-    step_v_err = float(jnp.sqrt(jnp.mean(v_step**2)))
+    # Step top
+    x_st = jnp.linspace(x_min, 0.0, n)
+    y_st = jnp.full(n, H_STEP)
+    u_st, v_st, _ = eval_uvp_batch_bs_raw(model, x_st, y_st, x_min, x_max, H_CHAN)
+
+    # Step face
+    x_sf = jnp.zeros(n)
+    y_sf = jnp.linspace(0.0, H_STEP, n)
+    u_sf, v_sf, _ = eval_uvp_batch_bs_raw(model, x_sf, y_sf, x_min, x_max, H_CHAN)
+
+    # Outlet
+    x_out = jnp.full(n, x_max)
+    y_out = jnp.linspace(0.0, H_CHAN, n)
+    _, _, p_out = eval_uvp_batch_bs_raw(model, x_out, y_out, x_min, x_max, H_CHAN)
 
     print("\n── BC sanity check (RMS errors) ──────────────────────────────")
-    print(
-        f"  Inlet   u error : {inlet_u_err:.2e}   v error  : {inlet_v_err:.2e}  [hard]"
-    )
-    print(
-        f"  Outlet  p error : {outlet_p_err:.2e}                          [soft — nonzero OK]"
-    )
-    print(f"  Bottom wall u   : {wall_u_err:.2e}   v        : {wall_v_err:.2e}  [hard]")
-    print(f"  Step face   u   : {step_u_err:.2e}   v        : {step_v_err:.2e}  [hard]")
+    print(f"  Inlet      u: {_rms(u_in - u_ref):.2e}   v: {_rms(v_in):.2e}")
+    print(f"  Top wall   u: {_rms(u_top):.2e}   v: {_rms(v_top):.2e}")
+    print(f"  Bottom wall u: {_rms(u_bot):.2e}   v: {_rms(v_bot):.2e}")
+    print(f"  Step top   u: {_rms(u_st):.2e}   v: {_rms(v_st):.2e}")
+    print(f"  Step face  u: {_rms(u_sf):.2e}   v: {_rms(v_sf):.2e}")
+    print(f"  Outlet     p: {_rms(p_out):.2e}")
     print("──────────────────────────────────────────────────────────────\n")
 
 
@@ -202,11 +327,12 @@ if __name__ == "__main__":
     cfg = get_config(Re)
     X_MAX = cfg["x_max"]
 
-    print(f"\nBackward step PINN v2  |  Re = {Re}")
-    print(f"  Domain      : x ∈ [{X_MIN}, {X_MAX:.1f}]  y ∈ [0, {H_CHAN}]")
+    print(f"\nBackward step PINN v2 (soft BCs)  |  Re = {Re}")
+    print(f"  Domain      : x in [{X_MIN}, {X_MAX:.1f}]  y in [0, {H_CHAN}]")
     print(f"  Network     : {cfg['widths']}")
     print(f"  Adam epochs : {cfg['adam_epochs']}   L-BFGS steps: {cfg['lbfgs_steps']}")
-    print(f"  Collocation : {cfg['n_col']}   x_recirc ≈ {cfg['x_recirc']:.1f} H\n")
+    print(f"  Collocation : {cfg['n_col']}   BC pts/seg: {cfg['n_bc']}")
+    print(f"  x_recirc    : {cfg['x_recirc']:.1f} H\n")
 
     RESULTS_DIR = f"results/backward_step_v2/Re{int(Re)}"
     PLOTS_DIR = f"plots/backward_step_v2/Re{int(Re)}"
@@ -217,7 +343,6 @@ if __name__ == "__main__":
     ADAM_LOSSES_FILE = os.path.join(RESULTS_DIR, "adam_losses.txt")
     LBFGS_LOSSES_FILE = os.path.join(RESULTS_DIR, "lbfgs_losses.txt")
 
-    # Always create the model first
     key = jax.random.key(0)
     model = BackwardStepPINN(
         widths=cfg["widths"],
@@ -227,20 +352,27 @@ if __name__ == "__main__":
     )
 
     # --------------------------------------------------------
-    # sample collocation points
+    # sample points (boundary points are fixed; collocation resampled)
     # --------------------------------------------------------
-    _, k1 = jax.random.split(key, 2)
-    print("Sampling collocation points...")
-    x_col, y_col = sample_interior(k1, cfg["n_col"], X_MAX, cfg["x_recirc"])
-    print(f"  interior: {len(x_col)}\n")
+    RESAMPLE_EVERY = 2000
+
+    k_col, k_bc = jax.random.split(key, 2)
+    print("Sampling boundary points...")
+    bc_pts = sample_boundaries(k_bc, cfg["n_bc"], X_MIN, X_MAX, H_STEP, H_CHAN)
+    print(f"  boundary : {cfg['n_bc']} x 6 segments = {cfg['n_bc'] * 6}")
+
+    print("Sampling initial collocation points...")
+    x_col, y_col = sample_interior(k_col, cfg["n_col"], X_MAX, cfg["x_recirc"])
+    print(f"  interior : {len(x_col)}\n")
 
     # --------------------------------------------------------
-    # loss
+    # loss + diagnostics
     # --------------------------------------------------------
-    loss_fn = make_loss_fn(model, Re, x_col, y_col, X_MAX)
+    loss_fn = make_loss_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
+    diag_fn = make_diag_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
 
     # --------------------------------------------------------
-    # Adam with cosine LR decay (nnx.Optimizer)
+    # Adam with cosine LR decay
     # --------------------------------------------------------
     lr_schedule = optax.cosine_decay_schedule(
         init_value=cfg["lr_start"],
@@ -258,6 +390,7 @@ if __name__ == "__main__":
 
     adam_losses = []
     LOG_EVERY = 20
+    DIAG_EVERY = 2000
     t0 = time.perf_counter()
 
     with tqdm(
@@ -272,6 +405,30 @@ if __name__ == "__main__":
                 pbar.set_postfix(loss=f"{last_loss:.3e}")
             pbar.update(1)
 
+            if epoch > 0 and epoch % DIAG_EVERY == 0:
+                phys, inlet, walls, step_bc, outlet = diag_fn(model)
+                pbar.write(
+                    f"  [diag {epoch}] phys={float(phys):.2e}  inlet={float(inlet):.2e}"
+                    f"  walls={float(walls):.2e}  step={float(step_bc):.2e}"
+                    f"  outlet={float(outlet):.2e}"
+                )
+
+            if epoch > 0 and epoch % RESAMPLE_EVERY == 0:
+                k_col = jax.random.fold_in(k_col, epoch)
+                x_col, y_col = sample_interior(
+                    k_col, cfg["n_col"], X_MAX, cfg["x_recirc"]
+                )
+                loss_fn = make_loss_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
+                diag_fn = make_diag_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
+
+                @nnx.jit
+                def adam_step(model, opt):
+                    loss, grads = nnx.value_and_grad(loss_fn)(model)
+                    opt.update(model, grads)
+                    return loss
+
+                pbar.write(f"  [resample {epoch}] new collocation points")
+
             if epoch > cfg["adam_epochs"] // 2 and epoch % LOG_EVERY == 0:
                 window = 1000
                 if len(adam_losses) >= 2 * window:
@@ -285,10 +442,18 @@ if __name__ == "__main__":
 
     adam_time = time.perf_counter() - t0
     print(f"Adam complete in {adam_time:.1f} s\n")
-    check_bcs(model, X_MAX)
+    check_bcs(model, X_MIN, X_MAX)
+
+    phys, inlet, walls, step_bc, outlet = diag_fn(model)
+    print(f"── Loss breakdown after Adam ──")
+    print(
+        f"  phys={float(phys):.2e}  inlet={float(inlet):.2e}"
+        f"  walls={float(walls):.2e}  step={float(step_bc):.2e}"
+        f"  outlet={float(outlet):.2e}\n"
+    )
 
     # --------------------------------------------------------
-    # L-BFGS (nnx.split/merge pattern)
+    # L-BFGS (uses last collocation set)
     # --------------------------------------------------------
     graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 
@@ -299,7 +464,7 @@ if __name__ == "__main__":
     lbfgs_opt = optax.lbfgs()
     lbfgs_state = lbfgs_opt.init(params)
 
-    @nnx.jit
+    @jax.jit
     def lbfgs_train_step(params, opt_state):
         return lbfgs_step(graphdef, params, rest, opt_state, lbfgs_opt, loss_of_params)
 
@@ -322,7 +487,7 @@ if __name__ == "__main__":
                 rel = abs(lbfgs_losses[step] - lbfgs_losses[step - 200]) / abs(
                     lbfgs_losses[step - 200]
                 )
-                if rel < 1e-3:
+                if rel < 1e-4:
                     pbar.write(f"Early stopping at step {step}")
                     break
 
@@ -331,7 +496,16 @@ if __name__ == "__main__":
 
     lbfgs_time = time.perf_counter() - t1
     print(f"L-BFGS complete in {lbfgs_time:.1f} s\n")
-    check_bcs(model, X_MAX)
+    check_bcs(model, X_MIN, X_MAX)
+
+    diag_fn = make_diag_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
+    phys, inlet, walls, step_bc, outlet = diag_fn(model)
+    print(f"── Loss breakdown after L-BFGS ──")
+    print(
+        f"  phys={float(phys):.2e}  inlet={float(inlet):.2e}"
+        f"  walls={float(walls):.2e}  step={float(step_bc):.2e}"
+        f"  outlet={float(outlet):.2e}\n"
+    )
 
     # --------------------------------------------------------
     # save
@@ -364,15 +538,13 @@ if __name__ == "__main__":
     X, Y = jnp.meshgrid(x1d, y1d)
     mask = ~((X < 0.0) & (Y < H_STEP))
 
-    u, v, p = eval_uvp_batch_bs(
+    u, v, p = eval_uvp_batch_bs_raw(
         model,
         X.ravel(),
         Y.ravel(),
         X_MIN,
         X_MAX,
         H_CHAN,
-        H_STEP,
-        U_MEAN,
     )
     u = jnp.where(mask, u.reshape(Ny, Nx), jnp.nan)
     v = jnp.where(mask, v.reshape(Ny, Nx), jnp.nan)
@@ -386,21 +558,19 @@ if __name__ == "__main__":
     x_probe = jnp.linspace(0.1, X_MAX, N_PROBE)
     y_probe = jnp.full(N_PROBE, 0.15)
 
-    u_wall, _, _ = eval_uvp_batch_bs(
+    u_wall, _, _ = eval_uvp_batch_bs_raw(
         model,
         x_probe,
         y_probe,
         X_MIN,
         X_MAX,
         H_CHAN,
-        H_STEP,
-        U_MEAN,
     )
 
     u_wall_min = float(jnp.min(u_wall))
     print(
         f"  min u at y=0.15 : {u_wall_min:.4f}  "
-        f"({'backflow detected' if u_wall_min < 0 else 'NO backflow — check ansatz'})"
+        f"({'backflow detected' if u_wall_min < 0 else 'NO backflow'})"
     )
 
     transitions = jnp.diff(jnp.sign(u_wall))
