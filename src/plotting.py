@@ -189,6 +189,305 @@ def plot_lid_cavity(X, Y, u, v, p, psi, x_vortex, y_vortex, Re, plots_dir="plots
     plt.close(fig)
 
 
+def plot_Re_convergence(Re_history, Re_true, plots_dir="plots"):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(Re_history, color="steelblue", lw=1.5, label="Inferred Re")
+    ax.axhline(Re_true, color="crimson", ls="--", lw=1.5, label=f"True Re = {Re_true:.0f}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Re")
+    ax.set_title("Reynolds number inference — PINN inverse problem")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "Re_convergence.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  saved {path}")
+
+
+def plot_observation_points(x_obs, y_obs, plots_dir="plots",
+                            x_min=-2.0, x_max=20.0, h_step=1.0, h_chan=2.0):
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.scatter(np.array(x_obs), np.array(y_obs), s=8, color="steelblue", alpha=0.7)
+    step = plt.Polygon(
+        [[x_min, 0], [0, 0], [0, h_step], [x_min, h_step]],
+        closed=True, fc="lightgray", ec="gray",
+    )
+    ax.add_patch(step)
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(0, h_chan)
+    ax.set_aspect("equal")
+    ax.set_title(f"Observation points (N={len(x_obs)})")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "observation_points.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  saved {path}")
+
+
+def plot_inference_loss(loss_history, plots_dir="plots"):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.semilogy(loss_history, color="steelblue", lw=1.2)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Inference training loss")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(plots_dir, "loss.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  saved {path}")
+
+
+def plot_gradient_error_bubble(
+    u_pinn,
+    dudy_pinn,
+    u_of,
+    Re,
+    plots_dir="plots",
+    filename="gradient_error_bubble.png",
+):
+    """Bubble plot: |∂u/∂y| (shear rate) vs u, coloured by |u_pinn − u_OF|.
+
+    Each point is one spatial location in the backward-step domain.
+    Reveals that high-gradient regions (shear layer, step corner) carry
+    the largest PINN error.
+
+    Parameters
+    ----------
+    u_pinn   : 1-D array  — PINN u velocity at each sample point
+    dudy_pinn: 1-D array  — ∂u/∂y from PINN autodiff at each sample point
+    u_of     : 1-D array  — OpenFOAM u interpolated to the same points
+    Re       : float      — Reynolds number (used in title)
+    """
+    u_pinn = np.asarray(u_pinn)
+    dudy   = np.abs(np.asarray(dudy_pinn))
+    u_of   = np.asarray(u_of)
+
+    # Drop NaN (OpenFOAM griddata extrapolation failures near boundaries)
+    valid = np.isfinite(u_pinn) & np.isfinite(dudy) & np.isfinite(u_of)
+    u_pinn, dudy, u_of = u_pinn[valid], dudy[valid], u_of[valid]
+
+    error = np.abs(u_pinn - u_of)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sc = ax.scatter(
+        dudy,
+        u_pinn,
+        c=error,
+        cmap="RdYlBu_r",
+        s=10,
+        alpha=0.65,
+        linewidths=0,
+        rasterized=True,
+    )
+    cb = fig.colorbar(sc, ax=ax, pad=0.02)
+    cb.set_label(r"$|u_{\mathrm{PINN}} - u_{\mathrm{OF}}|$", fontsize=11)
+
+    ax.set_xlabel(r"$|\partial u / \partial y|$  (shear rate)", fontsize=11)
+    ax.set_ylabel(r"$u / U_{\mathrm{mean}}$", fontsize=11)
+    ax.set_title(
+        rf"PINN error vs. local shear rate  —  Re = {Re:.0f}",
+        fontsize=11,
+    )
+    ax.set_xscale("symlog", linthresh=1e-2)
+    ax.grid(True, alpha=0.25, linewidth=0.5)
+
+    fig.tight_layout()
+    path = os.path.join(plots_dir, filename)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path}")
+
+
+def plot_backward_step_comparison(
+    X, Y,
+    u_of, v_of, p_of,
+    u_pinn, v_pinn, p_pinn,
+    Re,
+    h_step=1.0,
+    plots_dir="plots",
+    filename="field_comparison.png",
+    vlims=None,
+):
+    """3×3 comparison plot: OpenFOAM | PINN | absolute error  for u, v, p.
+
+    Mirrors the Taylor-Green comparison layout so the two cases read identically
+    in the report.
+
+    Parameters
+    ----------
+    vlims : dict, optional
+        Pre-computed colorbar limits for shared-range plots across Re values.
+        Expected keys: 'u', 'v', 'p' → (vmin, vmax) for field columns,
+                       'u_err', 'v_err', 'p_err' → (0, vmax) for error column.
+        If None, each subplot uses its own local min/max.
+    """
+    fields = [
+        (u_of, u_pinn, "u", r"$u$"),
+        (v_of, v_pinn, "v", r"$v$"),
+        (p_of, p_pinn, "p", r"$p$"),
+    ]
+    col_titles = ["OpenFOAM (reference)", "PINN (predicted)", "Absolute error"]
+
+    fig, axes = plt.subplots(3, 3, figsize=(15, 7))
+
+    for row, (ref, pred, key, name) in enumerate(fields):
+        ref  = np.asarray(ref)
+        pred = np.asarray(pred)
+        err  = np.abs(pred - ref)
+
+        err_vmax = np.nanmax(err)
+
+        for col, (data, cmap) in enumerate([
+            (ref,  "RdBu_r"),
+            (pred, "RdBu_r"),
+            (err,  "hot_r"),
+        ]):
+            ax = axes[row, col]
+            if col < 2:
+                # Each subplot has its own range, but always centred at 0
+                # so white = zero, blue = negative, red = positive
+                vlim = max(abs(np.nanmin(data)), abs(np.nanmax(data)))
+                lvls = np.linspace(-vlim, vlim, 51)
+                cf = ax.contourf(X, Y, data, levels=lvls, cmap=cmap,
+                                 vmin=-vlim, vmax=vlim)
+            else:
+                cf = ax.contourf(X, Y, data, levels=50, cmap=cmap,
+                                 vmin=0, vmax=err_vmax)
+            fig.colorbar(cf, ax=ax, pad=0.02)
+
+            ax.add_patch(mpatches.Rectangle(
+                (float(X.min()), 0.0), abs(float(X.min())), h_step,
+                color="0.4", zorder=5,
+            ))
+            ax.set_aspect("equal")
+            ax.set_xlim(float(X.min()), float(X.max()))
+            ax.set_ylim(0.0, float(Y.max()))
+            ax.set_xlabel("$x/h$", fontsize=9)
+            if col == 0:
+                ax.set_ylabel(f"{name}   $y/h$", fontsize=9)
+            if row == 0:
+                ax.set_title(col_titles[col], fontsize=10)
+
+    fig.suptitle(
+        rf"Backward-facing step  —  Re = {Re:.0f}   (PINN vs. OpenFOAM)",
+        fontsize=12, y=1.01,
+    )
+    fig.tight_layout()
+    path = os.path.join(plots_dir, filename)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path}")
+
+
+def plot_spatial_error_map(
+    X, Y, u_pinn, u_of, Re,
+    h_step=1.0, x_min=-2.0,
+    plots_dir="plots",
+    filename="spatial_error_map.png",
+):
+    """2-D heatmap of |u_pinn − u_OF| over the backward-step domain.
+
+    Parameters
+    ----------
+    X, Y    : 2-D meshgrid arrays (Ny x Nx)
+    u_pinn  : 2-D array — PINN u on the same grid (NaN outside fluid domain)
+    u_of    : 2-D array — OpenFOAM u interpolated to the same grid
+    Re      : float
+    """
+    error = np.abs(np.asarray(u_pinn) - np.asarray(u_of))
+    X, Y  = np.asarray(X), np.asarray(Y)
+
+    fig, ax = plt.subplots(figsize=(13, 3.5))
+
+    cf = ax.contourf(X, Y, error, levels=50, cmap="hot_r")
+    fig.colorbar(cf, ax=ax, label=r"$|u_{\mathrm{PINN}} - u_{\mathrm{OF}}|$")
+
+    # Draw step block
+    ax.add_patch(mpatches.Rectangle(
+        (float(X.min()), 0.0), abs(float(X.min())), h_step,
+        color="0.45", zorder=5,
+    ))
+
+    ax.set_xlim(float(X.min()), float(X.max()))
+    ax.set_ylim(0.0, float(Y.max()))
+    ax.set_aspect("equal")
+    ax.set_xlabel("$x/h$")
+    ax.set_ylabel("$y/h$")
+    ax.set_title(rf"Pointwise $u$ error  |  PINN vs. OpenFOAM  —  Re = {Re:.0f}")
+
+    fig.tight_layout()
+    path = os.path.join(plots_dir, filename)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path}")
+
+
+def plot_lid_cavity_comparison(
+    X, Y,
+    u_of, v_of, p_of,
+    u_pinn, v_pinn, p_pinn,
+    Re,
+    plots_dir="plots",
+    filename="field_comparison.png",
+):
+    """3×3 comparison plot: OpenFOAM | PINN | absolute error  for u, v, p.
+    Adapted for the square lid-driven cavity domain (no step geometry).
+    """
+    fields = [
+        (u_of, u_pinn, r"$u$"),
+        (v_of, v_pinn, r"$v$"),
+        (p_of, p_pinn, r"$p$"),
+    ]
+    col_titles = ["OpenFOAM (reference)", "PINN (predicted)", "Absolute error"]
+
+    fig, axes = plt.subplots(3, 3, figsize=(13, 8))
+
+    for row, (ref, pred, name) in enumerate(fields):
+        ref  = np.asarray(ref)
+        pred = np.asarray(pred)
+        err  = np.abs(pred - ref)
+        err_vmax = np.nanmax(err)
+
+        for col, (data, cmap) in enumerate([
+            (ref,  "RdBu_r"),
+            (pred, "RdBu_r"),
+            (err,  "hot_r"),
+        ]):
+            ax = axes[row, col]
+            if col < 2:
+                vlim = max(abs(np.nanmin(data)), abs(np.nanmax(data)))
+                lvls = np.linspace(-vlim, vlim, 51)
+                cf = ax.contourf(X, Y, data, levels=lvls, cmap=cmap,
+                                 vmin=-vlim, vmax=vlim)
+            else:
+                cf = ax.contourf(X, Y, data, levels=50, cmap=cmap,
+                                 vmin=0, vmax=err_vmax)
+            fig.colorbar(cf, ax=ax, pad=0.02)
+
+            ax.set_aspect("equal")
+            ax.set_xlim(float(X.min()), float(X.max()))
+            ax.set_ylim(float(Y.min()), float(Y.max()))
+            ax.set_xlabel("$x$", fontsize=9)
+            if col == 0:
+                ax.set_ylabel(f"{name}   $y$", fontsize=9)
+            if row == 0:
+                ax.set_title(col_titles[col], fontsize=10)
+
+    fig.suptitle(
+        rf"Lid-driven cavity  —  Re = {Re:.0f}   (PINN vs. OpenFOAM)",
+        fontsize=12, y=1.01,
+    )
+    fig.tight_layout()
+    path = os.path.join(plots_dir, filename)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path}")
+
+
 def plot_comparison(
     X, Y, u_exact, v_exact, p_exact, u_pred, v_pred, p_pred, t, plots_dir="plots"
 ):

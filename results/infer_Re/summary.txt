@@ -1,8 +1,8 @@
-Re_true  = 200.0
-Re_init  = 800.0
-Re_final = 216.7609
-error_%  = 8.38
-n_obs    = 100
+Re_true  = 100.0
+Re_init  = 1000.0
+Re_final = 415.4053
+error_%  = 315.41
+n_obs    = 500
 w_data   = 100.0
-epochs   = 5000
-elapsed_s= 138.5
+epochs   = 8000
+elapsed_s= 349.1

@@ -13,6 +13,7 @@ jax.config.update("jax_enable_x64", True)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.pinn import BackwardStepPINN, load_model_state, eval_uvp_batch_lc
+from src.plotting import plot_lid_cavity_comparison
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -116,6 +117,71 @@ def _read_of_u(case_dir, time_dir=OF_TIME):
     return xi, yi, uvw[:, 0], uvw[:, 1]
 
 
+def _read_of_p(case_dir, time_dir=OF_TIME):
+    """Read the pressure field from an OpenFOAM lid-cavity case.
+
+    Returns
+    -------
+    xi, yi : 1-D arrays of cell-centre coordinates  (length n_cells)
+    p_of   : 1-D array of pressure values
+    """
+    p_path = os.path.join(case_dir, time_dir, "p")
+    values = []
+    reading = False
+    n_cells = None
+    with open(p_path) as fh:
+        for line in fh:
+            s = line.strip()
+            if not reading and s.isdigit() and int(s) > 10:
+                n_cells = int(s)
+                reading = True
+                continue
+            if reading and s == "(":
+                continue
+            if reading and s.startswith(")"):
+                break
+            if reading and s:
+                values.append(float(s))
+
+    p_arr = np.array(values)
+    N = int(round(n_cells ** 0.5))
+
+    x1d = -1.0 + (np.arange(N) + 0.5) * 2.0 / N
+    y1d = -1.0 + (np.arange(N) + 0.5) * 2.0 / N
+    xi = np.tile(x1d, N)
+    yi = np.repeat(y1d, N)
+
+    return xi, yi, p_arr
+
+
+def _of_to_grid(case_dir, N=200, time_dir=OF_TIME):
+    """Interpolate OpenFOAM u, v, p onto a regular N×N meshgrid over [-1,1]².
+
+    Returns
+    -------
+    X, Y     : 2-D meshgrids (shape N×N)
+    u_g, v_g, p_g : 2-D arrays on that grid
+    """
+    xi, yi, u_of, v_of = _read_of_u(case_dir, time_dir)
+    _, _, p_of = _read_of_p(case_dir, time_dir)
+
+    pts = np.column_stack([xi, yi])
+
+    x1d = np.linspace(-1.0, 1.0, N)
+    y1d = np.linspace(-1.0, 1.0, N)
+    X, Y = np.meshgrid(x1d, y1d)
+    query = np.column_stack([X.ravel(), Y.ravel()])
+
+    u_g = griddata(pts, u_of, query, method="linear").reshape(N, N)
+    v_g = griddata(pts, v_of, query, method="linear").reshape(N, N)
+    p_g = griddata(pts, p_of, query, method="linear").reshape(N, N)
+
+    # Remove mean pressure so PINN and OF are on the same datum
+    p_g -= np.nanmean(p_g)
+
+    return X, Y, u_g, v_g, p_g
+
+
 def of_probe_line(case_dir, axis, n_pts=300, time_dir=OF_TIME):
     xi, yi, u_of, v_of = _read_of_u(case_dir, time_dir)
     pts = np.column_stack([xi, yi])
@@ -135,6 +201,62 @@ def of_probe_line(case_dir, axis, n_pts=300, time_dir=OF_TIME):
         return interior, u_line, v_line
 
     raise ValueError("axis must be 'x' or 'y'")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Field comparison plots  (3×3: u / v / p  ×  OF / PINN / error)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def make_field_comparison_plots(out_dir=OUT_DIR, N_grid=200):
+    """Generate a 3×3 contourf comparison for each Re value."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    for Re in RE_VALUES:
+        pinn_path = PINN_RESULTS.format(re=int(Re))
+        of_dir = OF_CASES.get(Re)
+
+        if not os.path.exists(pinn_path):
+            print(f"  Re={Re}: PINN file not found — {pinn_path}, skipping field plot")
+            continue
+
+        if of_dir is None or not os.path.isdir(of_dir):
+            print(f"  Re={Re}: OF directory not found — {of_dir}, skipping field plot")
+            continue
+
+        print(f"  Re={Re}: building field comparison …")
+
+        # ── Load PINN ──
+        model = load_pinn_model(pinn_path)
+
+        x1d = np.linspace(-1.0, 1.0, N_grid)
+        y1d = np.linspace(-1.0, 1.0, N_grid)
+        X, Y = np.meshgrid(x1d, y1d)
+        u_p, v_p, p_p = eval_pinn(model, X.ravel(), Y.ravel())
+        u_p = u_p.reshape(N_grid, N_grid)
+        v_p = v_p.reshape(N_grid, N_grid)
+        p_p = p_p.reshape(N_grid, N_grid)
+        # Shift PINN pressure to zero mean so it is on the same datum as OF
+        p_p -= np.nanmean(p_p)
+
+        # ── Load + interpolate OpenFOAM ──
+        try:
+            X_of, Y_of, u_of, v_of, p_of = _of_to_grid(of_dir, N=N_grid)
+        except Exception as exc:
+            print(f"    WARNING: OF grid read failed for Re={Re}: {exc}, skipping")
+            continue
+
+        # ── Plot ──
+        fname = f"lid_cavity_fields_Re{int(Re)}.png"
+        plot_lid_cavity_comparison(
+            X, Y,
+            u_of, v_of, p_of,
+            u_p, v_p, p_p,
+            Re=Re,
+            plots_dir=out_dir,
+            filename=fname,
+        )
+        print(f"    Saved → {os.path.join(out_dir, fname)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -234,6 +356,10 @@ def main():
         print(f"Saved → {out_path}")
 
     plt.close(fig)
+
+    # ── Field comparison plots (3×3 contourf) ──
+    print("\nGenerating field comparison plots …")
+    make_field_comparison_plots(out_dir=OUT_DIR)
 
 
 if __name__ == "__main__":

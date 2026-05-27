@@ -12,7 +12,18 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.pinn import BackwardStepPINN, load_model_state, eval_uvp_batch_bs_raw
+from src.pinn import (
+    BackwardStepPINN,
+    load_model_state,
+    eval_uvp_batch_bs_raw,
+    FourierBackwardStepPINN,
+    load_fourier_model,
+)
+from src.models import SirenPINN
+from src.plotting import (
+    plot_spatial_error_map,
+    plot_backward_step_comparison,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -35,6 +46,7 @@ ACTIVATION = jax.nn.tanh
 RE_VALUES = [100, 200, 400]
 
 PINN_RESULTS = "results/backward_step_v2/Re{re}/params.npz"
+SIREN_RESULTS = "results/backward_step_siren/Re{re}/params.npz"
 
 OF_CASES = {
     100: "openfoam/run/backwardStep_parabolic_re100",
@@ -44,7 +56,7 @@ OF_CASES = {
 OF_TIME = "20"
 
 X_PROBE = 7.0  # x/h for vertical u(y) profiles
-Y_PROBE = 0.5  # y/h for horizontal u(x) profiles
+Y_PROBE = 0.1  # y/h for horizontal u(x) profiles
 
 OUT_DIR = "figures"
 
@@ -55,9 +67,18 @@ OUT_DIR = "figures"
 
 
 def load_pinn_model(path):
-    """Load a BackwardStepPINN, inferring architecture from the saved file."""
+    """Load a BackwardStepPINN or FourierBackwardStepPINN from a .npz file.
+
+    Automatically detects Fourier models (saved by save_fourier_model) by
+    checking for the ``_n_fourier`` key and delegates to load_fourier_model.
+    """
     data = np.load(path)
 
+    # ── Fourier-feature model ─────────────────────────────────────────────
+    if "_n_fourier" in data:
+        return load_fourier_model(path, key=jax.random.key(0), activation=ACTIVATION)
+
+    # ── Standard BackwardStepPINN ─────────────────────────────────────────
     if "_n" in data:
         if "_widths" in data:
             widths = [int(w) for w in data["_widths"]]
@@ -78,6 +99,7 @@ def load_pinn_model(path):
         load_model_state(model, path)
         return model
 
+    # ── Legacy format (W0/b0 keys) ────────────────────────────────────────
     n = sum(1 for k in data if k.startswith("W"))
     if n == 0:
         raise ValueError(f"No weight arrays found in {path}")
@@ -96,7 +118,28 @@ def load_pinn_model(path):
     return model
 
 
-RE_X_MAX = {100: 20.0, 200: 20.0, 400: 25.0}
+def load_siren_model(path, omega_0=30.0):
+    """Load a SirenPINN, inferring architecture from the saved file."""
+    data = np.load(path)
+    if "_widths" in data:
+        widths = [int(w) for w in data["_widths"]]
+        n_inputs = int(data["_n_inputs"]) if "_n_inputs" in data else 2
+    else:
+        widths = [32, 32, 32, 32]
+        n_inputs = 2
+        print(f"  WARNING: {path} has no _widths metadata. Using fallback {widths}.")
+
+    model = SirenPINN(
+        widths=widths,
+        key=jax.random.key(0),
+        n_inputs=n_inputs,
+        omega_0=omega_0,
+    )
+    load_model_state(model, path)
+    return model
+
+
+RE_X_MAX = {100: 20.0, 200: 20.0, 400: 30.0}
 
 
 def eval_pinn(model, x_arr, y_arr, x_max=X_MAX):
@@ -214,6 +257,36 @@ def _parse_of_vector_field(filepath, n_cells):
     return arr
 
 
+def _parse_of_scalar_field(filepath, n_cells):
+    """Parse the internal field of a scalar OpenFOAM file (e.g. p)."""
+    with open(filepath) as fh:
+        txt = fh.read()
+
+    values = []
+    reading = False
+    for line in txt.split("\n"):
+        s = line.strip()
+        if s == str(n_cells):
+            reading = True
+            continue
+        if reading and s == "(":
+            continue
+        if reading and s.startswith(")"):
+            break
+        if reading and s:
+            try:
+                values.append(float(s))
+            except ValueError:
+                pass
+
+    arr = np.array(values)
+    if len(arr) != n_cells:
+        raise RuntimeError(
+            f"Expected {n_cells} pressure values, got {len(arr)} in {filepath}"
+        )
+    return arr
+
+
 def of_probe_line(case_dir, x_fixed=None, y_fixed=None, n_pts=300, time_dir=OF_TIME):
     """
     Extract a probe line from a native OpenFOAM case by interpolating
@@ -312,6 +385,229 @@ def first_negative_to_positive_crossing(x, u):
                 return x[i]
             return x[i] - u[i] * dx / du
     return None
+
+
+def make_field_comparison_plots(
+    out_dir, pinn_results=None, label="v2", model_loader=None
+):
+    """For each Re, produce the 3×3 comparison figure (OF | PINN | error) for u, v, p.
+
+    All Re values share the same colorbar range per field so plots are directly
+    comparable: one range for u, one for v, one for p, one for each error field.
+    """
+    from scipy.interpolate import griddata
+
+    if pinn_results is None:
+        pinn_results = PINN_RESULTS
+    if model_loader is None:
+        model_loader = load_pinn_model
+
+    # ── Pass 1: collect all fields, compute global colorbar limits ────────
+    all_data = {}  # Re → dict of arrays
+    for Re in RE_VALUES:
+        pinn_path = pinn_results.format(re=int(Re))
+        of_dir = OF_CASES.get(Re)
+        if not os.path.exists(pinn_path) or of_dir is None or not os.path.isdir(of_dir):
+            continue
+
+        x_max_re = RE_X_MAX.get(Re, X_MAX)
+        model = model_loader(pinn_path)
+
+        Nx, Ny = 400, 80
+        x1d = np.linspace(X_MIN, x_max_re, Nx)
+        y1d = np.linspace(0.0, H_CHAN, Ny)
+        Xg, Yg = np.meshgrid(x1d, y1d)
+        fluid = ~((Xg < 0.0) & (Yg < H_STEP))
+
+        u_pinn, v_pinn, p_pinn = eval_pinn(
+            model, Xg.ravel(), Yg.ravel(), x_max=x_max_re
+        )
+        u_pinn = np.where(fluid, u_pinn.reshape(Ny, Nx), np.nan)
+        v_pinn = np.where(fluid, v_pinn.reshape(Ny, Nx), np.nan)
+        p_pinn = np.where(fluid, p_pinn.reshape(Ny, Nx), np.nan)
+        p_pinn = p_pinn - np.nanmean(p_pinn)
+
+        try:
+            x_of, y_of, n_cells = _of_cell_centers(of_dir)
+            q = np.column_stack([Xg.ravel(), Yg.ravel()])
+            of_pts = np.column_stack([x_of, y_of])
+
+            uvw = _parse_of_vector_field(os.path.join(of_dir, OF_TIME, "U"), n_cells)
+            u_of = griddata(of_pts, uvw[:, 0], q, method="linear").reshape(Ny, Nx)
+            v_of = griddata(of_pts, uvw[:, 1], q, method="linear").reshape(Ny, Nx)
+            u_of = np.where(fluid, u_of, np.nan)
+            v_of = np.where(fluid, v_of, np.nan)
+
+            p_path = os.path.join(of_dir, OF_TIME, "p")
+            if os.path.exists(p_path):
+                p_raw = _parse_of_scalar_field(p_path, n_cells)
+                p_of = griddata(of_pts, p_raw, q, method="linear").reshape(Ny, Nx)
+                p_of = np.where(fluid, p_of, np.nan)
+                p_of = p_of - np.nanmean(p_of)
+            else:
+                p_of = np.zeros_like(u_of)
+        except Exception as exc:
+            print(f"    WARNING: OF interpolation failed for Re={Re}: {exc}")
+            continue
+
+        all_data[Re] = dict(
+            Xg=Xg,
+            Yg=Yg,
+            u_of=u_of,
+            v_of=v_of,
+            p_of=p_of,
+            u_pinn=u_pinn,
+            v_pinn=v_pinn,
+            p_pinn=p_pinn,
+        )
+
+    if not all_data:
+        print(f"  No data found for [{label}], skipping field comparison.")
+        return
+
+    # Global limits: take the symmetric range from OpenFOAM (reference) across all Re
+    def _global_lim(arrays):
+        lo = min(np.nanmin(a) for a in arrays)
+        hi = max(np.nanmax(a) for a in arrays)
+        return lo, hi
+
+    vlims = {
+        "u": _global_lim([d["u_of"] for d in all_data.values()]),
+        "v": _global_lim([d["v_of"] for d in all_data.values()]),
+        "p": _global_lim([d["p_of"] for d in all_data.values()]),
+        "u_err": max(
+            np.nanmax(np.abs(d["u_pinn"] - d["u_of"])) for d in all_data.values()
+        ),
+        "v_err": max(
+            np.nanmax(np.abs(d["v_pinn"] - d["v_of"])) for d in all_data.values()
+        ),
+        "p_err": max(
+            np.nanmax(np.abs(d["p_pinn"] - d["p_of"])) for d in all_data.values()
+        ),
+    }
+    print(f"  [{label}] shared colorbar limits:")
+    for k, v in vlims.items():
+        print(f"    {k}: {v}")
+
+    # ── Pass 2: plot with shared limits ───────────────────────────────────
+    for Re, d in all_data.items():
+        print(f"  Field comparison [{label}] Re={Re}...")
+        plots_dir = f"plots/backward_step_{label}/Re{int(Re)}"
+        os.makedirs(plots_dir, exist_ok=True)
+
+        plot_backward_step_comparison(
+            d["Xg"],
+            d["Yg"],
+            d["u_of"],
+            d["v_of"],
+            d["p_of"],
+            d["u_pinn"],
+            d["v_pinn"],
+            d["p_pinn"],
+            Re,
+            h_step=H_STEP,
+            plots_dir=plots_dir,
+            filename="field_comparison.png",
+            vlims=vlims,
+        )
+        plot_backward_step_comparison(
+            d["Xg"],
+            d["Yg"],
+            d["u_of"],
+            d["v_of"],
+            d["p_of"],
+            d["u_pinn"],
+            d["v_pinn"],
+            d["p_pinn"],
+            Re,
+            h_step=H_STEP,
+            plots_dir=out_dir,
+            filename=f"field_comparison_{label}_Re{int(Re)}.png",
+            vlims=vlims,
+        )
+
+
+def make_spatial_error_plots(out_dir, pinn_results=None, label="v2", model_loader=None):
+    """For each Re, produce a 2-D heatmap of |u_pinn − u_OF| over the domain."""
+    from scipy.interpolate import griddata
+
+    if pinn_results is None:
+        pinn_results = PINN_RESULTS
+    if model_loader is None:
+        model_loader = load_pinn_model
+
+    for Re in RE_VALUES:
+        pinn_path = pinn_results.format(re=int(Re))
+        of_dir = OF_CASES.get(Re)
+
+        if not os.path.exists(pinn_path):
+            print(f"  Spatial error [{label}] Re={Re}: PINN file not found, skipping.")
+            continue
+        if of_dir is None or not os.path.isdir(of_dir):
+            print(
+                f"  Spatial error [{label}] Re={Re}: OpenFOAM directory not found, skipping."
+            )
+            continue
+
+        print(f"  Spatial error map [{label}] Re={Re}...")
+        x_max_re = RE_X_MAX.get(Re, X_MAX)
+        model = model_loader(pinn_path)
+
+        # Regular grid over the fluid domain
+        Nx, Ny = 400, 80
+        x1d = np.linspace(X_MIN, x_max_re, Nx)
+        y1d = np.linspace(0.0, H_CHAN, Ny)
+        Xg, Yg = np.meshgrid(x1d, y1d)  # (Ny, Nx)
+        fluid = ~((Xg < 0.0) & (Yg < H_STEP))  # mask out step block
+
+        # PINN u on the grid
+        u_pinn, _, _ = eval_pinn(model, Xg.ravel(), Yg.ravel(), x_max=x_max_re)
+        u_pinn = u_pinn.reshape(Ny, Nx)
+        u_pinn = np.where(fluid, u_pinn, np.nan)
+
+        # OpenFOAM u interpolated onto the same grid
+        try:
+            x_of, y_of, n_cells = _of_cell_centers(of_dir)
+            u_path = os.path.join(of_dir, OF_TIME, "U")
+            uvw = _parse_of_vector_field(u_path, n_cells)
+            q = np.column_stack([Xg.ravel(), Yg.ravel()])
+            u_of_flat = griddata(
+                np.column_stack([x_of, y_of]),
+                uvw[:, 0],
+                q,
+                method="linear",
+            )
+            u_of = u_of_flat.reshape(Ny, Nx)
+            u_of = np.where(fluid, u_of, np.nan)
+        except Exception as exc:
+            print(f"    WARNING: OF interpolation failed for Re={Re}: {exc}")
+            continue
+
+        plots_dir = f"plots/backward_step_{label}/Re{int(Re)}"
+        os.makedirs(plots_dir, exist_ok=True)
+        plot_spatial_error_map(
+            Xg,
+            Yg,
+            u_pinn,
+            u_of,
+            Re,
+            h_step=H_STEP,
+            x_min=X_MIN,
+            plots_dir=plots_dir,
+            filename="spatial_error_map.png",
+        )
+        # Also save to the shared figures dir
+        plot_spatial_error_map(
+            Xg,
+            Yg,
+            u_pinn,
+            u_of,
+            Re,
+            h_step=H_STEP,
+            x_min=X_MIN,
+            plots_dir=out_dir,
+            filename=f"spatial_error_map_{label}_Re{int(Re)}.png",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -482,6 +778,32 @@ def main():
         print(f"Saved → {out_path}")
 
     plt.close(fig)
+
+    # ── Field comparison (OF | PINN | error) ─────────────────────────────
+    print("\nGenerating field comparison plots...")
+    make_field_comparison_plots(OUT_DIR)
+
+    # ── Spatial error maps ────────────────────────────────────────────────
+    print("\nGenerating spatial error maps...")
+    make_spatial_error_plots(OUT_DIR)
+
+    # ── SIREN field comparison (OF | PINN | error) ────────────────────────
+    print("\nGenerating SIREN field comparison plots...")
+    make_field_comparison_plots(
+        OUT_DIR,
+        pinn_results=SIREN_RESULTS,
+        label="siren",
+        model_loader=load_siren_model,
+    )
+
+    # ── SIREN spatial error maps ──────────────────────────────────────────
+    print("\nGenerating SIREN spatial error maps...")
+    make_spatial_error_plots(
+        OUT_DIR,
+        pinn_results=SIREN_RESULTS,
+        label="siren",
+        model_loader=load_siren_model,
+    )
 
 
 if __name__ == "__main__":

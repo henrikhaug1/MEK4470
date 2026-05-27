@@ -11,9 +11,9 @@ import optax
 from tqdm import tqdm
 
 from src.pinn import (
-    BackwardStepPINN,
+    FourierBackwardStepPINN,
     lbfgs_step,
-    save_model,
+    save_fourier_model,
     eval_uvp_batch_bs_raw,
     residuals_batch_bs_raw,
     dudx_at_outlet_bs_raw,
@@ -40,17 +40,21 @@ U_MEAN = 1.0
 
 
 WIDTHS = [128, 128, 128, 128]
+N_FOURIER = 16  # Fourier feature pairs → 2×16 = 32-dim input to MLP
 N_COL = 12000
-N_BC = 1000
-ADAM_EPOCHS = 10000
-LBFGS_STEPS = 8000
+N_BC = 2000
+ADAM_EPOCHS = 8000
+LBFGS_STEPS = 5000
 LR_START = 1e-3
 LR_END = 1e-5
 
 
 def get_config(Re):
     x_r_est = 0.025 * Re
-    x_max = max(20.0, x_r_est * 2.5)
+    if Re >= 400:
+        x_max = 30.0
+    else:
+        x_max = 20.0
     return dict(
         x_max=x_max,
         widths=WIDTHS,
@@ -161,88 +165,33 @@ def inlet_profile(y, h_step, h_chan, u_mean):
     return u_mean * 6.0 * (y - h_step) * (h_chan - y) / (h_chan - h_step) ** 2
 
 
-W_PHYS = 10.0
-W_INLET = 10.0
-W_TOP = 10.0
-W_BOTTOM = 10.0
-W_STEP_TOP = 20.0
-W_STEP_FACE = 20.0
-W_OUTLET_P = 1.0
-W_OUTLET_GRAD = 5.0
+N_FLUX_SECTIONS = 15
+N_FLUX_QUAD = 40
+
+# ── Fixed loss weights — [cont, mom, inlet, walls, step, outlet, flux] ───────
+LOSS_WEIGHTS = np.array([5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 2.0])
 
 
-def make_loss_fn(Re, x_col, y_col, bc_pts, x_min, x_max):
+def make_loss_fn(
+    Re, x_col, y_col, bc_pts, x_min, x_max, x_flux, y_flux_quad, weights=LOSS_WEIGHTS
+):
+    """weights: array of 7 floats — [cont, mom, inlet, walls, step, outlet, flux]."""
     (x_in, y_in, x_top, y_top, x_bot, y_bot, x_st, y_st, x_sf, y_sf, x_out, y_out) = (
         bc_pts
     )
 
     u_inlet_ref = inlet_profile(y_in, H_STEP, H_CHAN, U_MEAN)
+    target_flux = U_MEAN * (H_CHAN - H_STEP)
+    w_cont, w_mom, w_inlet, w_walls, w_step, w_outlet, w_flux = (
+        float(w) for w in weights
+    )
 
     def loss_fn(m):
         cont, mom_x, mom_y = residuals_batch_bs_raw(
-            m,
-            Re,
-            x_col,
-            y_col,
-            x_min,
-            x_max,
-            H_CHAN,
+            m, Re, x_col, y_col, x_min, x_max, H_CHAN
         )
-        phys = jnp.mean(cont**2) + jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
-
-        u_i, v_i, _ = eval_uvp_batch_bs_raw(m, x_in, y_in, x_min, x_max, H_CHAN)
-        loss_inlet = jnp.mean((u_i - u_inlet_ref) ** 2) + jnp.mean(v_i**2)
-
-        u_t, v_t, _ = eval_uvp_batch_bs_raw(m, x_top, y_top, x_min, x_max, H_CHAN)
-        u_b, v_b, _ = eval_uvp_batch_bs_raw(m, x_bot, y_bot, x_min, x_max, H_CHAN)
-        loss_top = jnp.mean(u_t**2 + v_t**2)
-        loss_bot = jnp.mean(u_b**2 + v_b**2)
-
-        u_st, v_st, _ = eval_uvp_batch_bs_raw(m, x_st, y_st, x_min, x_max, H_CHAN)
-        u_sf, v_sf, _ = eval_uvp_batch_bs_raw(m, x_sf, y_sf, x_min, x_max, H_CHAN)
-        loss_step_top = jnp.mean(u_st**2 + v_st**2)
-        loss_step_face = jnp.mean(u_sf**2 + v_sf**2)
-
-        _, _, p_o = eval_uvp_batch_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
-        loss_outlet_p = jnp.mean(p_o**2)
-
-        dudx_o, dvdx_o = dudx_at_outlet_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
-        loss_outlet_grad = jnp.mean(dudx_o**2) + jnp.mean(dvdx_o**2)
-
-        total = (
-            W_PHYS * phys
-            + W_INLET * loss_inlet
-            + W_TOP * loss_top
-            + W_BOTTOM * loss_bot
-            + W_STEP_TOP * loss_step_top
-            + W_STEP_FACE * loss_step_face
-            + W_OUTLET_P * loss_outlet_p
-            + W_OUTLET_GRAD * loss_outlet_grad
-        )
-        return total
-
-    return loss_fn
-
-
-def make_diag_fn(Re, x_col, y_col, bc_pts, x_min, x_max):
-    """Return individual loss components for logging (not JIT-compiled)."""
-    (x_in, y_in, x_top, y_top, x_bot, y_bot, x_st, y_st, x_sf, y_sf, x_out, y_out) = (
-        bc_pts
-    )
-    u_inlet_ref = inlet_profile(y_in, H_STEP, H_CHAN, U_MEAN)
-
-    @jax.jit
-    def diag_fn(m):
-        cont, mom_x, mom_y = residuals_batch_bs_raw(
-            m,
-            Re,
-            x_col,
-            y_col,
-            x_min,
-            x_max,
-            H_CHAN,
-        )
-        phys = jnp.mean(cont**2) + jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
+        loss_cont = jnp.mean(cont**2)
+        loss_mom = jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
 
         u_i, v_i, _ = eval_uvp_batch_bs_raw(m, x_in, y_in, x_min, x_max, H_CHAN)
         loss_inlet = jnp.mean((u_i - u_inlet_ref) ** 2) + jnp.mean(v_i**2)
@@ -259,7 +208,85 @@ def make_diag_fn(Re, x_col, y_col, bc_pts, x_min, x_max):
         dudx_o, dvdx_o = dudx_at_outlet_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
         loss_outlet = jnp.mean(p_o**2) + jnp.mean(dudx_o**2) + jnp.mean(dvdx_o**2)
 
-        return phys, loss_inlet, loss_walls, loss_step, loss_outlet
+        def flux_at_section(x0):
+            x_pts = jnp.full_like(y_flux_quad, x0)
+            u_q, _, _ = eval_uvp_batch_bs_raw(
+                m, x_pts, y_flux_quad, x_min, x_max, H_CHAN
+            )
+            return jnp.trapezoid(u_q, y_flux_quad)
+
+        fluxes = jax.vmap(flux_at_section)(x_flux)
+        loss_flux = jnp.mean((fluxes - target_flux) ** 2)
+
+        return (
+            w_cont * loss_cont
+            + w_mom * loss_mom
+            + w_inlet * loss_inlet
+            + w_walls * loss_walls
+            + w_step * loss_step
+            + w_outlet * loss_outlet
+            + w_flux * loss_flux
+        )
+
+    return loss_fn
+
+
+def make_diag_fn(Re, x_col, y_col, bc_pts, x_min, x_max, x_flux, y_flux_quad):
+    """Return individual loss components for logging."""
+    (x_in, y_in, x_top, y_top, x_bot, y_bot, x_st, y_st, x_sf, y_sf, x_out, y_out) = (
+        bc_pts
+    )
+    u_inlet_ref = inlet_profile(y_in, H_STEP, H_CHAN, U_MEAN)
+    target_flux = U_MEAN * (H_CHAN - H_STEP)
+
+    @jax.jit
+    def diag_fn(m):
+        cont, mom_x, mom_y = residuals_batch_bs_raw(
+            m,
+            Re,
+            x_col,
+            y_col,
+            x_min,
+            x_max,
+            H_CHAN,
+        )
+        loss_cont = jnp.mean(cont**2)
+        loss_mom = jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
+
+        u_i, v_i, _ = eval_uvp_batch_bs_raw(m, x_in, y_in, x_min, x_max, H_CHAN)
+        loss_inlet = jnp.mean((u_i - u_inlet_ref) ** 2) + jnp.mean(v_i**2)
+
+        u_t, v_t, _ = eval_uvp_batch_bs_raw(m, x_top, y_top, x_min, x_max, H_CHAN)
+        u_b, v_b, _ = eval_uvp_batch_bs_raw(m, x_bot, y_bot, x_min, x_max, H_CHAN)
+        loss_walls = jnp.mean(u_t**2 + v_t**2) + jnp.mean(u_b**2 + v_b**2)
+
+        u_st, v_st, _ = eval_uvp_batch_bs_raw(m, x_st, y_st, x_min, x_max, H_CHAN)
+        u_sf, v_sf, _ = eval_uvp_batch_bs_raw(m, x_sf, y_sf, x_min, x_max, H_CHAN)
+        loss_step = jnp.mean(u_st**2 + v_st**2) + jnp.mean(u_sf**2 + v_sf**2)
+
+        _, _, p_o = eval_uvp_batch_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
+        dudx_o, dvdx_o = dudx_at_outlet_bs_raw(m, x_out, y_out, x_min, x_max, H_CHAN)
+        loss_outlet = jnp.mean(p_o**2) + jnp.mean(dudx_o**2) + jnp.mean(dvdx_o**2)
+
+        def flux_at_section(x0):
+            x_pts = jnp.full_like(y_flux_quad, x0)
+            u_q, _, _ = eval_uvp_batch_bs_raw(
+                m, x_pts, y_flux_quad, x_min, x_max, H_CHAN
+            )
+            return jnp.trapezoid(u_q, y_flux_quad)
+
+        fluxes = jax.vmap(flux_at_section)(x_flux)
+        loss_flux = jnp.mean((fluxes - target_flux) ** 2)
+
+        return (
+            loss_cont,
+            loss_mom,
+            loss_inlet,
+            loss_walls,
+            loss_step,
+            loss_outlet,
+            loss_flux,
+        )
 
     return diag_fn
 
@@ -321,13 +348,15 @@ def check_bcs(model, x_min, x_max, n=200):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--Re", type=float, default=200.0)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     Re = args.Re
+    seed = args.seed
 
     cfg = get_config(Re)
     X_MAX = cfg["x_max"]
 
-    print(f"\nBackward step PINN v2 (soft BCs)  |  Re = {Re}")
+    print(f"\nBackward step PINN v2 (soft BCs)  |  Re = {Re}  seed = {seed}")
     print(f"  Domain      : x in [{X_MIN}, {X_MAX:.1f}]  y in [0, {H_CHAN}]")
     print(f"  Network     : {cfg['widths']}")
     print(f"  Adam epochs : {cfg['adam_epochs']}   L-BFGS steps: {cfg['lbfgs_steps']}")
@@ -343,12 +372,13 @@ if __name__ == "__main__":
     ADAM_LOSSES_FILE = os.path.join(RESULTS_DIR, "adam_losses.txt")
     LBFGS_LOSSES_FILE = os.path.join(RESULTS_DIR, "lbfgs_losses.txt")
 
-    key = jax.random.key(0)
-    model = BackwardStepPINN(
+    key = jax.random.key(seed)
+    model = FourierBackwardStepPINN(
         widths=cfg["widths"],
         key=key,
         activation=jax.nn.tanh,
         n_inputs=2,
+        n_fourier=N_FOURIER,
     )
 
     # --------------------------------------------------------
@@ -366,10 +396,16 @@ if __name__ == "__main__":
     print(f"  interior : {len(x_col)}\n")
 
     # --------------------------------------------------------
-    # loss + diagnostics
+    # mass flux quadrature (fixed throughout training)
     # --------------------------------------------------------
-    loss_fn = make_loss_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
-    diag_fn = make_diag_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
+    x_flux = jnp.linspace(1.0, X_MAX - 1.0, N_FLUX_SECTIONS)
+    y_flux_quad = jnp.linspace(0.0, H_CHAN, N_FLUX_QUAD)
+
+    # --------------------------------------------------------
+    # Loss + diagnostics (fixed weights)
+    # --------------------------------------------------------
+    loss_fn = make_loss_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX, x_flux, y_flux_quad)
+    diag_fn = make_diag_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX, x_flux, y_flux_quad)
 
     # --------------------------------------------------------
     # Adam with cosine LR decay
@@ -406,11 +442,14 @@ if __name__ == "__main__":
             pbar.update(1)
 
             if epoch > 0 and epoch % DIAG_EVERY == 0:
-                phys, inlet, walls, step_bc, outlet = diag_fn(model)
+                d_cont, d_mom, d_inlet, d_walls, d_step, d_outlet, d_flux = diag_fn(
+                    model
+                )
                 pbar.write(
-                    f"  [diag {epoch}] phys={float(phys):.2e}  inlet={float(inlet):.2e}"
-                    f"  walls={float(walls):.2e}  step={float(step_bc):.2e}"
-                    f"  outlet={float(outlet):.2e}"
+                    f"  [diag {epoch}] cont={float(d_cont):.2e}  mom={float(d_mom):.2e}"
+                    f"  inlet={float(d_inlet):.2e}  walls={float(d_walls):.2e}"
+                    f"  step={float(d_step):.2e}  outlet={float(d_outlet):.2e}"
+                    f"  flux={float(d_flux):.2e}"
                 )
 
             if epoch > 0 and epoch % RESAMPLE_EVERY == 0:
@@ -418,8 +457,19 @@ if __name__ == "__main__":
                 x_col, y_col = sample_interior(
                     k_col, cfg["n_col"], X_MAX, cfg["x_recirc"]
                 )
-                loss_fn = make_loss_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
-                diag_fn = make_diag_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
+                loss_fn = make_loss_fn(
+                    Re,
+                    x_col,
+                    y_col,
+                    bc_pts,
+                    X_MIN,
+                    X_MAX,
+                    x_flux,
+                    y_flux_quad,
+                )
+                diag_fn = make_diag_fn(
+                    Re, x_col, y_col, bc_pts, X_MIN, X_MAX, x_flux, y_flux_quad
+                )
 
                 @nnx.jit
                 def adam_step(model, opt):
@@ -444,12 +494,13 @@ if __name__ == "__main__":
     print(f"Adam complete in {adam_time:.1f} s\n")
     check_bcs(model, X_MIN, X_MAX)
 
-    phys, inlet, walls, step_bc, outlet = diag_fn(model)
+    d_cont, d_mom, d_inlet, d_walls, d_step, d_outlet, d_flux = diag_fn(model)
     print(f"── Loss breakdown after Adam ──")
     print(
-        f"  phys={float(phys):.2e}  inlet={float(inlet):.2e}"
-        f"  walls={float(walls):.2e}  step={float(step_bc):.2e}"
-        f"  outlet={float(outlet):.2e}\n"
+        f"  cont={float(d_cont):.2e}  mom={float(d_mom):.2e}"
+        f"  inlet={float(d_inlet):.2e}  walls={float(d_walls):.2e}"
+        f"  step={float(d_step):.2e}  outlet={float(d_outlet):.2e}"
+        f"  flux={float(d_flux):.2e}\n"
     )
 
     # --------------------------------------------------------
@@ -498,19 +549,20 @@ if __name__ == "__main__":
     print(f"L-BFGS complete in {lbfgs_time:.1f} s\n")
     check_bcs(model, X_MIN, X_MAX)
 
-    diag_fn = make_diag_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX)
-    phys, inlet, walls, step_bc, outlet = diag_fn(model)
+    diag_fn = make_diag_fn(Re, x_col, y_col, bc_pts, X_MIN, X_MAX, x_flux, y_flux_quad)
+    d_cont, d_mom, d_inlet, d_walls, d_step, d_outlet, d_flux = diag_fn(model)
     print(f"── Loss breakdown after L-BFGS ──")
     print(
-        f"  phys={float(phys):.2e}  inlet={float(inlet):.2e}"
-        f"  walls={float(walls):.2e}  step={float(step_bc):.2e}"
-        f"  outlet={float(outlet):.2e}\n"
+        f"  cont={float(d_cont):.2e}  mom={float(d_mom):.2e}"
+        f"  inlet={float(d_inlet):.2e}  walls={float(d_walls):.2e}"
+        f"  step={float(d_step):.2e}  outlet={float(d_outlet):.2e}"
+        f"  flux={float(d_flux):.2e}\n"
     )
 
     # --------------------------------------------------------
     # save
     # --------------------------------------------------------
-    save_model(model, PARAMS_FILE)
+    save_fourier_model(model, PARAMS_FILE)
     np.savetxt(ADAM_LOSSES_FILE, np.array(adam_losses))
     np.savetxt(LBFGS_LOSSES_FILE, np.array(lbfgs_losses))
     with open(os.path.join(RESULTS_DIR, "timing.json"), "w") as f:

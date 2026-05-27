@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from tqdm import tqdm
 
 from src.pinn import (
     BackwardStepPINN,
@@ -25,29 +26,23 @@ jax.config.update("jax_enable_x64", True)
 
 
 # ============================================================
-# Re-adaptive configuration
+# Configuration  (matches train_backward_step_v2.py)
 # ============================================================
 
+WIDTHS      = [128, 128, 128, 128]
+N_COL       = 12000
+ADAM_EPOCHS = 8000
+LBFGS_STEPS = 5000
+LR_START    = 1e-3
+LR_END      = 1e-5
 
-def get_config(Re):
-    if Re <= 100:
-        n_col, adam_epochs, lbfgs_steps = 8000, 5000, 1000
-    elif Re <= 400:
-        n_col, adam_epochs, lbfgs_steps = 10000, 8000, 2000
-    else:
-        n_col, adam_epochs, lbfgs_steps = 12000, 10000, 3000
-    return dict(
-        widths=[128, 128, 128, 128],
-        n_col=n_col,
-        adam_epochs=adam_epochs,
-        lr_start=1e-3,
-        lr_end=1e-5,
-        lbfgs_steps=lbfgs_steps,
-    )
+RESAMPLE_EVERY = 2000
+LOG_EVERY      = 20
+DIAG_EVERY     = 2000
 
 
 # ============================================================
-# loss
+# Loss
 # ============================================================
 
 
@@ -65,83 +60,66 @@ def make_loss_fn(Re, x_col, y_col):
 
 
 # ============================================================
-# main
+# Main
 # ============================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--Re", type=float, default=100.0)
-    parser.add_argument(
-        "--warm_start",
-        type=float,
-        default=None,
-        metavar="RE",
-        help="Re value of a previously trained run to warm-start from.",
-    )
+    parser.add_argument("--Re",   type=float, default=100.0)
+    parser.add_argument("--seed", type=int,   default=0)
     args = parser.parse_args()
-    Re = args.Re
+    Re   = args.Re
+    seed = args.seed
 
-    cfg = get_config(Re)
-
-    print(f"\nLid-driven cavity PINN  |  Re = {Re}")
+    print(f"\nLid-driven cavity PINN  |  Re = {Re}  seed = {seed}")
     print(f"  Domain      : [-1, 1]^2")
-    print(f"  Network     : {cfg['widths']}")
-    print(f"  Adam epochs : {cfg['adam_epochs']}   L-BFGS steps: {cfg['lbfgs_steps']}")
-    print(f"  Collocation : {cfg['n_col']}\n")
+    print(f"  Network     : {WIDTHS}")
+    print(f"  Adam epochs : {ADAM_EPOCHS}   L-BFGS steps: {LBFGS_STEPS}")
+    print(f"  Collocation : {N_COL}\n")
 
     RESULTS_DIR = f"results/lid_cavity/Re{int(Re)}"
-    PLOTS_DIR = f"plots/lid_cavity/Re{int(Re)}"
+    PLOTS_DIR   = f"plots/lid_cavity/Re{int(Re)}"
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    os.makedirs(PLOTS_DIR, exist_ok=True)
+    os.makedirs(PLOTS_DIR,   exist_ok=True)
 
-    PRED_FILES = {
-        "params": os.path.join(RESULTS_DIR, "params.npz"),
-        "adam_losses": os.path.join(RESULTS_DIR, "adam_losses.txt"),
-        "lbfgs_losses": os.path.join(RESULTS_DIR, "lbfgs_losses.txt"),
-    }
+    PARAMS_FILE      = os.path.join(RESULTS_DIR, "params.npz")
+    ADAM_LOSSES_FILE = os.path.join(RESULTS_DIR, "adam_losses.txt")
+    LBFGS_LOSSES_FILE= os.path.join(RESULTS_DIR, "lbfgs_losses.txt")
 
-    key = jax.random.key(0)
+    key = jax.random.key(seed)
     model = BackwardStepPINN(
-        widths=cfg["widths"],
+        widths=WIDTHS,
         key=key,
         activation=jax.nn.tanh,
         n_inputs=2,
     )
 
-    if all(os.path.exists(PRED_FILES[k]) for k in PRED_FILES):
+    if all(os.path.exists(p) for p in [PARAMS_FILE, ADAM_LOSSES_FILE, LBFGS_LOSSES_FILE]):
         print(f"Loading saved params from {RESULTS_DIR}/\n")
-        load_model_state(model, PRED_FILES["params"])
-        adam_losses = np.loadtxt(PRED_FILES["adam_losses"]).tolist()
-        lbfgs_losses = np.loadtxt(PRED_FILES["lbfgs_losses"]).tolist()
+        load_model_state(model, PARAMS_FILE)
+        adam_losses  = np.loadtxt(ADAM_LOSSES_FILE).tolist()
+        lbfgs_losses = np.loadtxt(LBFGS_LOSSES_FILE).tolist()
 
     else:
-        if args.warm_start is not None:
-            warm_path = f"results/lid_cavity/Re{int(args.warm_start)}/params.npz"
-            print(f"Warm-starting from {warm_path}\n")
-            load_model_state(model, warm_path)
-
         # --------------------------------------------------------
-        # sample points
+        # Sample collocation points (boundary BCs via hard ansatz)
         # --------------------------------------------------------
-        (k1,) = jax.random.split(key, 1)
+        k_col = key
         print("Sampling collocation points...")
-        x_col, y_col = sample_interior_lc(k1, cfg["n_col"])
+        x_col, y_col = sample_interior_lc(k_col, N_COL)
         print(f"  interior: {len(x_col)}\n")
 
-        # --------------------------------------------------------
-        # loss
-        # --------------------------------------------------------
         loss_fn = make_loss_fn(Re, x_col, y_col)
 
         # --------------------------------------------------------
-        # Adam with cosine LR decay (nnx.Optimizer)
+        # Adam with cosine LR decay
         # --------------------------------------------------------
         lr_schedule = optax.cosine_decay_schedule(
-            init_value=cfg["lr_start"],
-            decay_steps=cfg["adam_epochs"],
-            alpha=cfg["lr_end"] / cfg["lr_start"],
+            init_value=LR_START,
+            decay_steps=ADAM_EPOCHS,
+            alpha=LR_END / LR_START,
         )
-        tx = optax.adam(learning_rate=lr_schedule)
+        tx  = optax.adam(learning_rate=lr_schedule)
         opt = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
         @nnx.jit
@@ -151,30 +129,57 @@ if __name__ == "__main__":
             return loss
 
         adam_losses = []
-        print("Starting Adam training...\n")
         t0 = time.perf_counter()
 
-        for epoch in range(cfg["adam_epochs"]):
-            loss = adam_step(model, opt)
-            adam_losses.append(float(loss))
+        with tqdm(total=ADAM_EPOCHS, desc="Adam", unit="epoch", dynamic_ncols=True) as pbar:
+            for epoch in range(ADAM_EPOCHS):
+                loss = adam_step(model, opt)
 
-            if epoch % 500 == 0:
-                print(f"Epoch {epoch:6d} | loss = {loss:.6e}")
+                if epoch % LOG_EVERY == 0:
+                    last_loss = float(loss)
+                    adam_losses.extend([last_loss] * LOG_EVERY)
+                    pbar.set_postfix(loss=f"{last_loss:.3e}")
+                pbar.update(1)
 
-            if args.warm_start is None and epoch > cfg["adam_epochs"] // 2:
-                window = 1000
-                if len(adam_losses) >= 2 * window:
-                    recent = np.mean(adam_losses[-window:])
-                    older = np.mean(adam_losses[-2 * window : -window])
-                    if abs(recent - older) / abs(older) < 5e-4:
-                        print(f"\nEarly stopping at epoch {epoch}")
-                        break
+                # diagnostic breakdown
+                if epoch > 0 and epoch % DIAG_EVERY == 0:
+                    cont, mom_x, mom_y = residuals_batch_lc(model, Re, x_col, y_col)
+                    d_cont = float(jnp.mean(cont**2))
+                    d_mom  = float(jnp.mean(mom_x**2) + jnp.mean(mom_y**2))
+                    pbar.write(
+                        f"  [diag {epoch}] cont={d_cont:.2e}  mom={d_mom:.2e}"
+                    )
 
-        adam_time = time.perf_counter() - t0
-        print(f"\nAdam complete in {adam_time:.1f} s\n")
+                # resample interior points
+                if epoch > 0 and epoch % RESAMPLE_EVERY == 0:
+                    k_col = jax.random.fold_in(k_col, epoch)
+                    x_col, y_col = sample_interior_lc(k_col, N_COL)
+                    loss_fn = make_loss_fn(Re, x_col, y_col)
+
+                    @nnx.jit
+                    def adam_step(model, opt):
+                        loss, grads = nnx.value_and_grad(loss_fn)(model)
+                        opt.update(model, grads)
+                        return loss
+
+                    pbar.write(f"  [resample {epoch}] new collocation points")
+
+                # early stopping
+                if epoch > ADAM_EPOCHS // 2 and epoch % LOG_EVERY == 0:
+                    window = 1000
+                    if len(adam_losses) >= 2 * window:
+                        recent = np.mean(adam_losses[-window:])
+                        older  = np.mean(adam_losses[-2 * window : -window])
+                        if abs(recent - older) / (abs(older) + 1e-12) < 5e-4:
+                            pbar.write(f"Early stopping at epoch {epoch}")
+                            break
+
+        adam_losses = adam_losses[: epoch + 1]
+        adam_time   = time.perf_counter() - t0
+        print(f"Adam complete in {adam_time:.1f} s\n")
 
         # --------------------------------------------------------
-        # L-BFGS (nnx.split/merge)
+        # L-BFGS
         # --------------------------------------------------------
         graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 
@@ -182,7 +187,7 @@ if __name__ == "__main__":
             m = nnx.merge(graphdef, p, rest)
             return loss_fn(m)
 
-        lbfgs_opt = optax.lbfgs()
+        lbfgs_opt   = optax.lbfgs()
         lbfgs_state = lbfgs_opt.init(params)
 
         @jax.jit
@@ -190,41 +195,45 @@ if __name__ == "__main__":
             return lbfgs_step(graphdef, params, rest, opt_state, lbfgs_opt, loss_of_params)
 
         lbfgs_losses = []
-        print("Starting L-BFGS training...\n")
         t1 = time.perf_counter()
 
-        for step in range(cfg["lbfgs_steps"]):
-            params, lbfgs_state, loss = lbfgs_train_step(params, lbfgs_state)
-            lbfgs_losses.append(float(loss))
+        with tqdm(total=LBFGS_STEPS, desc="L-BFGS", unit="step", dynamic_ncols=True) as pbar:
+            for step in range(LBFGS_STEPS):
+                params, lbfgs_state, loss = lbfgs_train_step(params, lbfgs_state)
 
-            if step % 200 == 0:
-                print(f"Step {step:5d} | loss = {loss:.6e}")
+                if step % LOG_EVERY == 0:
+                    last_loss = float(loss)
+                    lbfgs_losses.extend([last_loss] * LOG_EVERY)
+                    pbar.set_postfix(loss=f"{last_loss:.3e}")
+                pbar.update(1)
 
-            if step >= 200:
-                rel = abs(lbfgs_losses[step] - lbfgs_losses[step - 200]) / abs(
-                    lbfgs_losses[step - 200]
-                )
-                if rel < 1e-3:
-                    print(f"\nEarly stopping at step {step}")
-                    break
+                # early stopping
+                if step >= 200 and step % LOG_EVERY == 0:
+                    rel = abs(lbfgs_losses[step] - lbfgs_losses[step - 200]) / (
+                        abs(lbfgs_losses[step - 200]) + 1e-12
+                    )
+                    if rel < 1e-4:
+                        pbar.write(f"Early stopping at step {step}")
+                        break
 
+        lbfgs_losses = lbfgs_losses[: step + 1]
         nnx.update(model, params)
 
         lbfgs_time = time.perf_counter() - t1
-        print(f"\nL-BFGS complete in {lbfgs_time:.1f} s\n")
+        print(f"L-BFGS complete in {lbfgs_time:.1f} s\n")
 
         # --------------------------------------------------------
-        # save
+        # Save
         # --------------------------------------------------------
-        save_model(model, PRED_FILES["params"])
-        np.savetxt(PRED_FILES["adam_losses"], np.array(adam_losses))
-        np.savetxt(PRED_FILES["lbfgs_losses"], np.array(lbfgs_losses))
+        save_model(model, PARAMS_FILE)
+        np.savetxt(ADAM_LOSSES_FILE,  np.array(adam_losses))
+        np.savetxt(LBFGS_LOSSES_FILE, np.array(lbfgs_losses))
         with open(os.path.join(RESULTS_DIR, "timing.json"), "w") as f:
             json.dump(
                 {
-                    "adam_s": adam_time,
-                    "lbfgs_s": lbfgs_time,
-                    "total_s": adam_time + lbfgs_time,
+                    "adam_s":      adam_time,
+                    "lbfgs_s":     lbfgs_time,
+                    "total_s":     adam_time + lbfgs_time,
                     "adam_epochs": len(adam_losses),
                     "lbfgs_steps": len(lbfgs_losses),
                 },
@@ -233,12 +242,12 @@ if __name__ == "__main__":
             )
 
     # ============================================================
-    # evaluation + plotting
+    # Evaluation + plotting
     # ============================================================
     plot_loss(adam_losses, lbfgs_losses, plots_dir=PLOTS_DIR)
 
     print("Evaluating final field...")
-    N = 150
+    N   = 150
     x1d = jnp.linspace(-1.0, 1.0, N)
     y1d = jnp.linspace(-1.0, 1.0, N)
     X, Y = jnp.meshgrid(x1d, y1d)
@@ -247,13 +256,12 @@ if __name__ == "__main__":
     u = u.reshape(N, N)
     v = v.reshape(N, N)
     p = p.reshape(N, N)
-
     p = p - jnp.mean(p)
 
-    # ---- streamfunction ----
+    # streamfunction (integrate u over y)
     u_np = np.array(u)
-    dy = float(y1d[1] - y1d[0])
-    psi = np.zeros_like(u_np)
+    dy   = float(y1d[1] - y1d[0])
+    psi  = np.zeros_like(u_np)
     for j in range(1, N):
         psi[j, :] = psi[j - 1, :] + 0.5 * (u_np[j - 1, :] + u_np[j, :]) * dy
 
@@ -264,16 +272,10 @@ if __name__ == "__main__":
     print(f"\nMain vortex centre: x = {x_vortex:.4f},  y = {y_vortex:.4f}")
 
     plot_lid_cavity(
-        np.array(X),
-        np.array(Y),
-        u_np,
-        np.array(v),
-        np.array(p),
-        psi,
-        x_vortex,
-        y_vortex,
-        Re,
-        plots_dir=PLOTS_DIR,
+        np.array(X), np.array(Y),
+        u_np, np.array(v), np.array(p),
+        psi, x_vortex, y_vortex,
+        Re, plots_dir=PLOTS_DIR,
     )
 
     print(f"\nFinished.\nPlots saved to:\n{PLOTS_DIR}\n")

@@ -18,7 +18,7 @@ convertToMeters 0.1;
 H       1.0;
 twoH    2.0;
 Lin     2.0;
-Ltotal  22.0;
+Ltotal  32.0;
 Z       0.1;
 
 vertices
