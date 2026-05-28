@@ -445,4 +445,4 @@ def plot_comparison(
     plt.tight_layout()
     if plots_dir is not None:
         fig.savefig(os.path.join(plots_dir, f"comparison_t{t}.png"), dpi=150)
-    return fig
+    plt.close(fig)

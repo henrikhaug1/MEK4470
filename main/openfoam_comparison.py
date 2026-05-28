@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 
 from src.analytical import taylor_green_u, taylor_green_v, taylor_green_p
-from src.pinn import TaylorGreenPINN, load_model_state, eval_uvp_batch
+from src.pinn import TaylorGreenPINN, load_model_state
 
 # ── paths ────────────────────────────────────────────────────────────────────
 FOAM_DIR = "openfoam/run/taylor_green_re200"
@@ -24,9 +24,11 @@ FOAM_FILES = {
 }
 
 # ── PINN model ──────────────────────────────────────────────────────────────
-pinn_model = TaylorGreenPINN(widths=[64, 64, 64], key=jax.random.key(0), activation=jax.nn.tanh)
 _params_path = os.path.join(PINN_RESULTS_DIR, "params.npz")
 _data = np.load(_params_path)
+_n_inputs = int(_data["W0"].shape[0]) if "W0" in _data else 5
+pinn_model = TaylorGreenPINN(widths=[64, 64, 64], key=jax.random.key(0),
+                              activation=jax.nn.tanh, n_inputs=_n_inputs)
 if "_n" in _data:
     load_model_state(pinn_model, _params_path)
 else:
@@ -34,6 +36,29 @@ else:
     for i in range(n):
         pinn_model.ws[i].value = jnp.array(_data[f"W{i}"])
         pinn_model.bs[i].value = jnp.array(_data[f"b{i}"])
+
+def _eval_uvp_batch_compat(model, x, y, t, t_max=2.0, n_inputs=5):
+    """Evaluate TG model, handling both legacy 3-input and current 5-input encoding."""
+    from src.taylor_green import _net_tg_physical
+
+    def _net_legacy(m, z, tm):
+        x_, y_, t_ = z[0], z[1], z[2]
+        t_n = 2.0 * t_ / tm - 1.0
+        inp = jnp.stack([x_, y_, t_n])
+        raw = m(inp[None])[0]
+        u_ic = jnp.cos(x_) * jnp.sin(y_)
+        v_ic = -jnp.sin(x_) * jnp.cos(y_)
+        p_ic = -0.25 * (jnp.cos(2.0 * x_) + jnp.cos(2.0 * y_))
+        return jnp.array([u_ic + t_ * raw[0], v_ic + t_ * raw[1], p_ic + t_ * raw[2]])
+
+    net_fn = _net_tg_physical if n_inputs == 5 else _net_legacy
+
+    def eval_single(xi, yi, ti):
+        out = net_fn(model, jnp.stack([xi, yi, ti]), t_max)
+        return out[0], out[1], out[2]
+
+    return jax.vmap(eval_single)(x, y, t)
+
 
 # ── settings ─────────────────────────────────────────────────────────────────
 Re = 200.0
@@ -187,7 +212,8 @@ if __name__ == "__main__":
 
         x_flat, y_flat = X.ravel(), Y.ravel()
         t_flat = jnp.full_like(x_flat, t_eval)
-        u_pinn, v_pinn, p_pinn = eval_uvp_batch(pinn_model, x_flat, y_flat, t_flat)
+        u_pinn, v_pinn, p_pinn = _eval_uvp_batch_compat(pinn_model, x_flat, y_flat, t_flat,
+                                                         n_inputs=_n_inputs)
         eu_p = relative_l2_error(u_pinn.reshape(X.shape), u_exact)
         ev_p = relative_l2_error(v_pinn.reshape(X.shape), v_exact)
         ep_p = relative_l2_error(p_pinn.reshape(X.shape), p_exact)

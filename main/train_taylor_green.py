@@ -59,13 +59,14 @@ if __name__ == "__main__":
         def adam_step(model, opt):
             def lf(m):
                 return loss_fn_tg(m, x_col, y_col, t_col, Re)
+
             loss, grads = nnx.value_and_grad(lf)(model)
             opt.update(model, grads)
             return loss
 
         adam_losses = []
         t_adam = time.perf_counter()
-        for epoch in range(12000):
+        for epoch in range(8000):
             loss = adam_step(model, opt)
             adam_losses.append(float(loss))
             if epoch % 500 == 0:
@@ -85,11 +86,13 @@ if __name__ == "__main__":
 
         @jax.jit
         def lbfgs_train_step(params, opt_state):
-            return lbfgs_step(graphdef, params, rest, opt_state, lbfgs_opt, loss_of_params)
+            return lbfgs_step(
+                graphdef, params, rest, opt_state, lbfgs_opt, loss_of_params
+            )
 
         lbfgs_losses = []
         t_lbfgs = time.perf_counter()
-        for step in range(500):
+        for step in range(5000):
             params, lbfgs_state, loss = lbfgs_train_step(params, lbfgs_state)
             lbfgs_losses.append(float(loss))
             if step % 200 == 0:

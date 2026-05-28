@@ -306,7 +306,7 @@ def _parse_of_scalar_field(filepath, n_cells):
     return arr
 
 
-def of_probe_line(case_dir, x_fixed=None, y_fixed=None, n_pts=300, time_dir=OF_TIME):
+def of_probe_line(case_dir, x_fixed=None, y_fixed=None, n_pts=300, time_dir=OF_TIME, x_max=None):
     """
     Extract a probe line from a native OpenFOAM case by interpolating
     cell-centred data with scipy griddata.
@@ -331,7 +331,8 @@ def of_probe_line(case_dir, x_fixed=None, y_fixed=None, n_pts=300, time_dir=OF_T
         return coord, ux, uy
 
     if y_fixed is not None:
-        x_lo, x_hi = 0.05, 19.95
+        x_lo = 0.05
+        x_hi = (x_max - 0.05) if x_max is not None else max(x_nd) - 0.05
         coord = np.linspace(x_lo, x_hi, n_pts)
         q = np.column_stack([coord, np.full(n_pts, y_fixed)])
         ux = griddata(pts, uvw[:, 0], q, method="linear")
@@ -659,8 +660,7 @@ def main():
             model = load_pinn_model(pinn_path)
 
             n_pts = 400
-            x_probe_max = min(x_max_re - 0.5, 19.95)
-            xx = np.linspace(0.05, x_probe_max, n_pts)
+            xx = np.linspace(0.05, x_max_re - 0.05, n_pts)
 
             u_p_x, _, _ = eval_pinn(model, xx, np.full(n_pts, Y_PROBE), x_max=x_max_re)
             ax.plot(xx, u_p_x, color="steelblue", lw=1.8, label="PINN", zorder=3)
@@ -674,7 +674,7 @@ def main():
         if of_dir is not None and os.path.isdir(of_dir):
             print(f"  Re={Re}: loading OpenFOAM from {of_dir}")
             try:
-                coord_x, of_ux_x, _ = of_probe_line(of_dir, y_fixed=Y_PROBE)
+                coord_x, of_ux_x, _ = of_probe_line(of_dir, y_fixed=Y_PROBE, x_max=x_max_re)
                 of_x_max = coord_x[-1]
                 ax.plot(
                     coord_x, of_ux_x,

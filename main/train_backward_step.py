@@ -39,7 +39,7 @@ X_MIN = -2.0
 X_MAX = 22.0
 H_STEP = 1.0
 H_CHAN = 2.0
-U_MAX = 1.0
+U_MEAN = 1.0
 
 
 # =========================================================
@@ -49,27 +49,27 @@ U_MAX = 1.0
 
 def make_loss_fn(Re, x_col, y_col, x_wall, y_wall, x_inlet, y_inlet, x_outlet, y_outlet):
     def inlet_profile(y):
-        return U_MAX * 4.0 * (y - H_STEP) * (H_CHAN - y) / (H_CHAN - H_STEP) ** 2
+        return U_MEAN * 6.0 * (y - H_STEP) * (H_CHAN - y) / (H_CHAN - H_STEP) ** 2
 
     def loss_fn(m):
         cont, mom_x, mom_y = residuals_batch_bs(
-            m, Re, x_col, y_col, X_MIN, X_MAX, H_CHAN, H_STEP, U_MAX,
+            m, Re, x_col, y_col, X_MIN, X_MAX, H_CHAN, H_STEP, U_MEAN,
         )
         physics_loss = jnp.mean(cont**2) + jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
 
         u_wall, v_wall, _ = eval_uvp_batch_bs(
-            m, x_wall, y_wall, X_MIN, X_MAX, H_CHAN, H_STEP, U_MAX,
+            m, x_wall, y_wall, X_MIN, X_MAX, H_CHAN, H_STEP, U_MEAN,
         )
         wall_loss = jnp.mean(u_wall**2) + jnp.mean(v_wall**2)
 
         u_in, v_in, _ = eval_uvp_batch_bs(
-            m, x_inlet, y_inlet, X_MIN, X_MAX, H_CHAN, H_STEP, U_MAX,
+            m, x_inlet, y_inlet, X_MIN, X_MAX, H_CHAN, H_STEP, U_MEAN,
         )
         u_ref = inlet_profile(y_inlet)
         inlet_loss = jnp.mean((u_in - u_ref) ** 2) + jnp.mean(v_in**2)
 
         _, _, p_out = eval_uvp_batch_bs(
-            m, x_outlet, y_outlet, X_MIN, X_MAX, H_CHAN, H_STEP, U_MAX,
+            m, x_outlet, y_outlet, X_MIN, X_MAX, H_CHAN, H_STEP, U_MEAN,
         )
         outlet_loss = jnp.mean(p_out**2)
 
@@ -247,7 +247,7 @@ if __name__ == "__main__":
     mask = ~((X < 0.0) & (Y < H_STEP))
 
     u, v, p = eval_uvp_batch_bs(
-        model, X.ravel(), Y.ravel(), X_MIN, X_MAX, H_CHAN, H_STEP, U_MAX,
+        model, X.ravel(), Y.ravel(), X_MIN, X_MAX, H_CHAN, H_STEP, U_MEAN,
     )
     u = jnp.where(mask, u.reshape(Ny, Nx), jnp.nan)
     v = jnp.where(mask, v.reshape(Ny, Nx), jnp.nan)
@@ -263,7 +263,7 @@ if __name__ == "__main__":
     y_probe = jnp.full(4000, 0.01)
 
     u_wall, _, _ = eval_uvp_batch_bs(
-        model, x_probe, y_probe, X_MIN, X_MAX, H_CHAN, H_STEP, U_MAX,
+        model, x_probe, y_probe, X_MIN, X_MAX, H_CHAN, H_STEP, U_MEAN,
     )
 
     transitions = jnp.diff(jnp.sign(u_wall))

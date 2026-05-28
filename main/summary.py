@@ -6,6 +6,7 @@ OpenFOAM times are read from log.icoFoam in each case directory (ClockTime on la
 If no log file exists the entry falls back to a hardcoded value or N/A.
 """
 
+import csv
 import json
 import os
 import re as re_module
@@ -70,7 +71,7 @@ OPENFOAM_CASES = [
     # Lid Cavity
     ("Lid Cavity",    100,  "upwind",  "openfoam/run/lid_cav_re100",                  None),
     ("Lid Cavity",    500,  "upwind",  "openfoam/run/lid_cav_re500",                  None),
-    ("Lid Cavity",    1000, "upwind",  "openfoam/run/lid_cav_re1000",                 None),
+    ("Lid Cavity",    800,  "upwind",  "openfoam/run/lid_cav_re800",                  None),
 ]
 
 OF_CONFIGS = {
@@ -124,6 +125,42 @@ for case_name, re_val, scheme, case_dir, hardcoded in OPENFOAM_CASES:
         "Config": OF_CONFIGS.get(case_name, ""),
     })
 
+# ── Collect Re-inference sweep timings ───────────────────────────────────────
+SWEEP_CSV = "results/infer_Re_sweep/sweep_results.csv"
+infer_rows = []
+
+if os.path.exists(SWEEP_CSV):
+    with open(SWEEP_CSV) as f:
+        reader = csv.DictReader(f)
+        sweep_data = list(reader)
+
+    has_elapsed = "elapsed_s" in (sweep_data[0] if sweep_data else {})
+    by_re = {}
+    for r in sweep_data:
+        re_true = int(float(r["Re_true"]))
+        by_re.setdefault(re_true, []).append(r)
+
+    for re_true in sorted(by_re):
+        runs = by_re[re_true]
+        n = len(runs)
+        if has_elapsed:
+            total_s = sum(float(r["elapsed_s"]) for r in runs)
+            per_run = total_s / n
+            timing_str = fmt(total_s)
+            per_run_str = f"{per_run:.0f}s/run"
+        else:
+            timing_str = "N/A"
+            per_run_str = "N/A"
+        err_pcts = [float(r["err_pct"]) for r in runs]
+        infer_rows.append({
+            "Re_true":  re_true,
+            "N_runs":   n,
+            "Per-run":  per_run_str,
+            "Total":    timing_str,
+            "Err min%": f"{min(err_pcts):.1f}",
+            "Err max%": f"{max(err_pcts):.1f}",
+        })
+
 # ── Print table ───────────────────────────────────────────────────────────────
 df = pd.DataFrame(rows)
 
@@ -141,7 +178,20 @@ for case_name, group in df.groupby("Case", sort=False):
         )
     )
 
+# ── Re inference sweep ────────────────────────────────────────────────────────
+if infer_rows:
+    print("\n  Re Inference (sweep, obs: OpenFOAM)")
+    df_inf = pd.DataFrame(infer_rows)
+    print(
+        df_inf.to_string(
+            index=False,
+            col_space={"Re_true": 8, "N_runs": 7, "Per-run": 10, "Total": 10,
+                       "Err min%": 10, "Err max%": 10},
+        )
+    )
+
 print()
 print("=" * 100)
 print("Note: PINN times include JAX JIT compilation on the first step.")
 print("      OpenFOAM times marked N/A have no log.icoFoam — fill in hardcoded values above.")
+print("      Re inference elapsed_s recorded from next sweep run onwards.")
