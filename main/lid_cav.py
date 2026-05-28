@@ -29,16 +29,16 @@ jax.config.update("jax_enable_x64", True)
 # Configuration  (matches train_backward_step_v2.py)
 # ============================================================
 
-WIDTHS      = [128, 128, 128, 128]
-N_COL       = 12000
+WIDTHS = [128, 128, 128, 128]
+N_COL = 12000
 ADAM_EPOCHS = 8000
-LBFGS_STEPS = 5000
-LR_START    = 1e-3
-LR_END      = 1e-5
+LBFGS_STEPS = 10000
+LR_START = 1e-3
+LR_END = 1e-5
 
-RESAMPLE_EVERY = 2000
-LOG_EVERY      = 20
-DIAG_EVERY     = 2000
+RESAMPLE_EVERY = 100
+LOG_EVERY = 20
+DIAG_EVERY = 2000
 
 
 # ============================================================
@@ -65,10 +65,10 @@ def make_loss_fn(Re, x_col, y_col):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--Re",   type=float, default=100.0)
-    parser.add_argument("--seed", type=int,   default=0)
+    parser.add_argument("--Re", type=float, default=100.0)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    Re   = args.Re
+    Re = args.Re
     seed = args.seed
 
     print(f"\nLid-driven cavity PINN  |  Re = {Re}  seed = {seed}")
@@ -78,13 +78,13 @@ if __name__ == "__main__":
     print(f"  Collocation : {N_COL}\n")
 
     RESULTS_DIR = f"results/lid_cavity/Re{int(Re)}"
-    PLOTS_DIR   = f"plots/lid_cavity/Re{int(Re)}"
+    PLOTS_DIR = f"plots/lid_cavity/Re{int(Re)}"
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    os.makedirs(PLOTS_DIR,   exist_ok=True)
+    os.makedirs(PLOTS_DIR, exist_ok=True)
 
-    PARAMS_FILE      = os.path.join(RESULTS_DIR, "params.npz")
+    PARAMS_FILE = os.path.join(RESULTS_DIR, "params.npz")
     ADAM_LOSSES_FILE = os.path.join(RESULTS_DIR, "adam_losses.txt")
-    LBFGS_LOSSES_FILE= os.path.join(RESULTS_DIR, "lbfgs_losses.txt")
+    LBFGS_LOSSES_FILE = os.path.join(RESULTS_DIR, "lbfgs_losses.txt")
 
     key = jax.random.key(seed)
     model = BackwardStepPINN(
@@ -94,10 +94,12 @@ if __name__ == "__main__":
         n_inputs=2,
     )
 
-    if all(os.path.exists(p) for p in [PARAMS_FILE, ADAM_LOSSES_FILE, LBFGS_LOSSES_FILE]):
+    if all(
+        os.path.exists(p) for p in [PARAMS_FILE, ADAM_LOSSES_FILE, LBFGS_LOSSES_FILE]
+    ):
         print(f"Loading saved params from {RESULTS_DIR}/\n")
         load_model_state(model, PARAMS_FILE)
-        adam_losses  = np.loadtxt(ADAM_LOSSES_FILE).tolist()
+        adam_losses = np.loadtxt(ADAM_LOSSES_FILE).tolist()
         lbfgs_losses = np.loadtxt(LBFGS_LOSSES_FILE).tolist()
 
     else:
@@ -119,7 +121,7 @@ if __name__ == "__main__":
             decay_steps=ADAM_EPOCHS,
             alpha=LR_END / LR_START,
         )
-        tx  = optax.adam(learning_rate=lr_schedule)
+        tx = optax.adam(learning_rate=lr_schedule)
         opt = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
         @nnx.jit
@@ -131,7 +133,9 @@ if __name__ == "__main__":
         adam_losses = []
         t0 = time.perf_counter()
 
-        with tqdm(total=ADAM_EPOCHS, desc="Adam", unit="epoch", dynamic_ncols=True) as pbar:
+        with tqdm(
+            total=ADAM_EPOCHS, desc="Adam", unit="epoch", dynamic_ncols=True
+        ) as pbar:
             for epoch in range(ADAM_EPOCHS):
                 loss = adam_step(model, opt)
 
@@ -145,10 +149,8 @@ if __name__ == "__main__":
                 if epoch > 0 and epoch % DIAG_EVERY == 0:
                     cont, mom_x, mom_y = residuals_batch_lc(model, Re, x_col, y_col)
                     d_cont = float(jnp.mean(cont**2))
-                    d_mom  = float(jnp.mean(mom_x**2) + jnp.mean(mom_y**2))
-                    pbar.write(
-                        f"  [diag {epoch}] cont={d_cont:.2e}  mom={d_mom:.2e}"
-                    )
+                    d_mom = float(jnp.mean(mom_x**2) + jnp.mean(mom_y**2))
+                    pbar.write(f"  [diag {epoch}] cont={d_cont:.2e}  mom={d_mom:.2e}")
 
                 # resample interior points
                 if epoch > 0 and epoch % RESAMPLE_EVERY == 0:
@@ -169,13 +171,13 @@ if __name__ == "__main__":
                     window = 1000
                     if len(adam_losses) >= 2 * window:
                         recent = np.mean(adam_losses[-window:])
-                        older  = np.mean(adam_losses[-2 * window : -window])
+                        older = np.mean(adam_losses[-2 * window : -window])
                         if abs(recent - older) / (abs(older) + 1e-12) < 5e-4:
                             pbar.write(f"Early stopping at epoch {epoch}")
                             break
 
         adam_losses = adam_losses[: epoch + 1]
-        adam_time   = time.perf_counter() - t0
+        adam_time = time.perf_counter() - t0
         print(f"Adam complete in {adam_time:.1f} s\n")
 
         # --------------------------------------------------------
@@ -187,17 +189,21 @@ if __name__ == "__main__":
             m = nnx.merge(graphdef, p, rest)
             return loss_fn(m)
 
-        lbfgs_opt   = optax.lbfgs()
+        lbfgs_opt = optax.lbfgs()
         lbfgs_state = lbfgs_opt.init(params)
 
         @jax.jit
         def lbfgs_train_step(params, opt_state):
-            return lbfgs_step(graphdef, params, rest, opt_state, lbfgs_opt, loss_of_params)
+            return lbfgs_step(
+                graphdef, params, rest, opt_state, lbfgs_opt, loss_of_params
+            )
 
         lbfgs_losses = []
         t1 = time.perf_counter()
 
-        with tqdm(total=LBFGS_STEPS, desc="L-BFGS", unit="step", dynamic_ncols=True) as pbar:
+        with tqdm(
+            total=LBFGS_STEPS, desc="L-BFGS", unit="step", dynamic_ncols=True
+        ) as pbar:
             for step in range(LBFGS_STEPS):
                 params, lbfgs_state, loss = lbfgs_train_step(params, lbfgs_state)
 
@@ -226,14 +232,14 @@ if __name__ == "__main__":
         # Save
         # --------------------------------------------------------
         save_model(model, PARAMS_FILE)
-        np.savetxt(ADAM_LOSSES_FILE,  np.array(adam_losses))
+        np.savetxt(ADAM_LOSSES_FILE, np.array(adam_losses))
         np.savetxt(LBFGS_LOSSES_FILE, np.array(lbfgs_losses))
         with open(os.path.join(RESULTS_DIR, "timing.json"), "w") as f:
             json.dump(
                 {
-                    "adam_s":      adam_time,
-                    "lbfgs_s":     lbfgs_time,
-                    "total_s":     adam_time + lbfgs_time,
+                    "adam_s": adam_time,
+                    "lbfgs_s": lbfgs_time,
+                    "total_s": adam_time + lbfgs_time,
                     "adam_epochs": len(adam_losses),
                     "lbfgs_steps": len(lbfgs_losses),
                 },
@@ -247,7 +253,7 @@ if __name__ == "__main__":
     plot_loss(adam_losses, lbfgs_losses, plots_dir=PLOTS_DIR)
 
     print("Evaluating final field...")
-    N   = 150
+    N = 150
     x1d = jnp.linspace(-1.0, 1.0, N)
     y1d = jnp.linspace(-1.0, 1.0, N)
     X, Y = jnp.meshgrid(x1d, y1d)
@@ -260,8 +266,8 @@ if __name__ == "__main__":
 
     # streamfunction (integrate u over y)
     u_np = np.array(u)
-    dy   = float(y1d[1] - y1d[0])
-    psi  = np.zeros_like(u_np)
+    dy = float(y1d[1] - y1d[0])
+    psi = np.zeros_like(u_np)
     for j in range(1, N):
         psi[j, :] = psi[j - 1, :] + 0.5 * (u_np[j - 1, :] + u_np[j, :]) * dy
 
@@ -272,10 +278,16 @@ if __name__ == "__main__":
     print(f"\nMain vortex centre: x = {x_vortex:.4f},  y = {y_vortex:.4f}")
 
     plot_lid_cavity(
-        np.array(X), np.array(Y),
-        u_np, np.array(v), np.array(p),
-        psi, x_vortex, y_vortex,
-        Re, plots_dir=PLOTS_DIR,
+        np.array(X),
+        np.array(Y),
+        u_np,
+        np.array(v),
+        np.array(p),
+        psi,
+        x_vortex,
+        y_vortex,
+        Re,
+        plots_dir=PLOTS_DIR,
     )
 
     print(f"\nFinished.\nPlots saved to:\n{PLOTS_DIR}\n")

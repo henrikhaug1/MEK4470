@@ -241,67 +241,6 @@ def plot_inference_loss(loss_history, plots_dir="plots"):
     print(f"  saved {path}")
 
 
-def plot_gradient_error_bubble(
-    u_pinn,
-    dudy_pinn,
-    u_of,
-    Re,
-    plots_dir="plots",
-    filename="gradient_error_bubble.png",
-):
-    """Bubble plot: |∂u/∂y| (shear rate) vs u, coloured by |u_pinn − u_OF|.
-
-    Each point is one spatial location in the backward-step domain.
-    Reveals that high-gradient regions (shear layer, step corner) carry
-    the largest PINN error.
-
-    Parameters
-    ----------
-    u_pinn   : 1-D array  — PINN u velocity at each sample point
-    dudy_pinn: 1-D array  — ∂u/∂y from PINN autodiff at each sample point
-    u_of     : 1-D array  — OpenFOAM u interpolated to the same points
-    Re       : float      — Reynolds number (used in title)
-    """
-    u_pinn = np.asarray(u_pinn)
-    dudy   = np.abs(np.asarray(dudy_pinn))
-    u_of   = np.asarray(u_of)
-
-    # Drop NaN (OpenFOAM griddata extrapolation failures near boundaries)
-    valid = np.isfinite(u_pinn) & np.isfinite(dudy) & np.isfinite(u_of)
-    u_pinn, dudy, u_of = u_pinn[valid], dudy[valid], u_of[valid]
-
-    error = np.abs(u_pinn - u_of)
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    sc = ax.scatter(
-        dudy,
-        u_pinn,
-        c=error,
-        cmap="RdYlBu_r",
-        s=10,
-        alpha=0.65,
-        linewidths=0,
-        rasterized=True,
-    )
-    cb = fig.colorbar(sc, ax=ax, pad=0.02)
-    cb.set_label(r"$|u_{\mathrm{PINN}} - u_{\mathrm{OF}}|$", fontsize=11)
-
-    ax.set_xlabel(r"$|\partial u / \partial y|$  (shear rate)", fontsize=11)
-    ax.set_ylabel(r"$u / U_{\mathrm{mean}}$", fontsize=11)
-    ax.set_title(
-        rf"PINN error vs. local shear rate  —  Re = {Re:.0f}",
-        fontsize=11,
-    )
-    ax.set_xscale("symlog", linthresh=1e-2)
-    ax.grid(True, alpha=0.25, linewidth=0.5)
-
-    fig.tight_layout()
-    path = os.path.join(plots_dir, filename)
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  saved {path}")
-
-
 def plot_backward_step_comparison(
     X, Y,
     u_of, v_of, p_of,

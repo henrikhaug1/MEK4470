@@ -19,7 +19,7 @@ from src.pinn import (
     FourierBackwardStepPINN,
     load_fourier_model,
 )
-from src.models import SirenPINN
+from src.backward_step import normalize_xy
 from src.plotting import (
     plot_spatial_error_map,
     plot_backward_step_comparison,
@@ -46,8 +46,6 @@ ACTIVATION = jax.nn.tanh
 RE_VALUES = [100, 200, 400]
 
 PINN_RESULTS = "results/backward_step_v2/Re{re}/params.npz"
-SIREN_RESULTS = "results/backward_step_siren/Re{re}/params.npz"
-
 OF_CASES = {
     100: "openfoam/run/backwardStep_parabolic_re100",
     200: "openfoam/run/backwardStep_parabolic_re200",
@@ -118,27 +116,6 @@ def load_pinn_model(path):
     return model
 
 
-def load_siren_model(path, omega_0=30.0):
-    """Load a SirenPINN, inferring architecture from the saved file."""
-    data = np.load(path)
-    if "_widths" in data:
-        widths = [int(w) for w in data["_widths"]]
-        n_inputs = int(data["_n_inputs"]) if "_n_inputs" in data else 2
-    else:
-        widths = [32, 32, 32, 32]
-        n_inputs = 2
-        print(f"  WARNING: {path} has no _widths metadata. Using fallback {widths}.")
-
-    model = SirenPINN(
-        widths=widths,
-        key=jax.random.key(0),
-        n_inputs=n_inputs,
-        omega_0=omega_0,
-    )
-    load_model_state(model, path)
-    return model
-
-
 RE_X_MAX = {100: 20.0, 200: 20.0, 400: 30.0}
 
 
@@ -153,6 +130,48 @@ def eval_pinn(model, x_arr, y_arr, x_max=X_MAX):
         H_CHAN,
     )
     return np.array(u), np.array(v), np.array(p)
+
+
+def eval_wall_shear_pinn(model, x_arr, x_max=X_MAX):
+    """Compute ∂u/∂y at y=0 (bottom wall) via JAX forward-mode AD.
+
+    Returns the non-dimensional velocity gradient, which is proportional to
+    the wall shear stress.  Positive = forward flow, negative = recirculation.
+    """
+    ey = jnp.array([0.0, 1.0])
+    xy_batch = jnp.stack(
+        [jnp.array(x_arr, dtype=float), jnp.zeros(len(x_arr), dtype=float)],
+        axis=-1,
+    )
+
+    def dudy_single(xy):
+        def net_fn(z):
+            x_n, y_n = normalize_xy(z[0], z[1], X_MIN, x_max, H_CHAN)
+            raw = model(jnp.stack([x_n, y_n])[None])[0]
+            return raw[0]   # u only
+
+        _, dudy = jax.jvp(net_fn, (xy,), (ey,))
+        return dudy
+
+    return np.array(jax.vmap(dudy_single)(xy_batch))
+
+
+def of_wall_shear(case_dir, n_pts=300, time_dir=OF_TIME):
+    """Estimate ∂u/∂y at y=0 from OpenFOAM cell-centre data.
+
+    Uses u(x, dy)/dy with dy equal to half the first-cell height (~0.025h).
+    OpenFOAM enforces no-slip exactly so u(y=0)=0.
+    """
+    x_of, y_of, n_cells = _of_cell_centers(case_dir, time_dir=time_dir)
+    uvw = _parse_of_vector_field(os.path.join(case_dir, time_dir, "U"), n_cells)
+
+    # Use a probe height just above the bottom wall; the first cell centre is
+    # at y ≈ H/(2·NY) = 1/40 = 0.025 h, so 0.03 h sits safely inside it.
+    dy = 0.03
+    xx = np.linspace(0.05, 19.95, n_pts)
+    q = np.column_stack([xx, np.full(n_pts, dy)])
+    u_dy = griddata(np.column_stack([x_of, y_of]), uvw[:, 0], q, method="linear")
+    return xx, u_dy / dy
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -620,15 +639,14 @@ def main():
 
     n_cols = len(RE_VALUES)
     fig, axes = plt.subplots(
-        2,
+        1,
         n_cols,
-        figsize=(3.8 * n_cols, 7.2),
+        figsize=(3.8 * n_cols, 3.6),
         squeeze=False,
     )
 
     for col, Re in enumerate(RE_VALUES):
-        ax_u_y = axes[0][col]  # top row:    u(y) at x = X_PROBE
-        ax_u_x = axes[1][col]  # bottom row: u(x) at y = Y_PROBE
+        ax = axes[0][col]
 
         x_max_re = RE_X_MAX.get(Re, X_MAX)
         pinn_cross = None
@@ -641,19 +659,11 @@ def main():
             model = load_pinn_model(pinn_path)
 
             n_pts = 400
-
-            # Top row: u(y) vertical profile at x = X_PROBE
-            y_lo = 0.0 if X_PROBE >= 0 else H_STEP
-            yy = np.linspace(y_lo, H_CHAN, n_pts)
-            u_p_y, _, _ = eval_pinn(model, np.full(n_pts, X_PROBE), yy, x_max=x_max_re)
-            ax_u_y.plot(u_p_y, yy, color="steelblue", lw=1.8, label="PINN", zorder=3)
-
-            # Bottom row: u(x) horizontal profile at y = Y_PROBE.
-            # This matches a horizontal line through the u-velocity heatmap.
             x_probe_max = min(x_max_re - 0.5, 19.95)
             xx = np.linspace(0.05, x_probe_max, n_pts)
+
             u_p_x, _, _ = eval_pinn(model, xx, np.full(n_pts, Y_PROBE), x_max=x_max_re)
-            ax_u_x.plot(xx, u_p_x, color="steelblue", lw=1.8, label="PINN", zorder=3)
+            ax.plot(xx, u_p_x, color="steelblue", lw=1.8, label="PINN", zorder=3)
             pinn_cross = first_negative_to_positive_crossing(xx, u_p_x)
         else:
             print(f"  Re={Re}: PINN file not found — {pinn_path}")
@@ -664,29 +674,12 @@ def main():
         if of_dir is not None and os.path.isdir(of_dir):
             print(f"  Re={Re}: loading OpenFOAM from {of_dir}")
             try:
-                # Top row: u(y) at x = X_PROBE
-                coord_y, of_ux_y, _ = of_probe_line(of_dir, x_fixed=X_PROBE)
-                ax_u_y.plot(
-                    of_ux_y,
-                    coord_y,
-                    color="darkorange",
-                    ls="--",
-                    lw=1.6,
-                    label="OpenFOAM",
-                    zorder=2,
-                )
-
-                # Bottom row: u(x) at y = Y_PROBE
                 coord_x, of_ux_x, _ = of_probe_line(of_dir, y_fixed=Y_PROBE)
                 of_x_max = coord_x[-1]
-                ax_u_x.plot(
-                    coord_x,
-                    of_ux_x,
-                    color="darkorange",
-                    ls="--",
-                    lw=1.6,
-                    label="OpenFOAM",
-                    zorder=2,
+                ax.plot(
+                    coord_x, of_ux_x,
+                    color="darkorange", ls="--", lw=1.6,
+                    label="OpenFOAM", zorder=2,
                 )
                 of_cross = first_negative_to_positive_crossing(coord_x, of_ux_x)
             except Exception as exc:
@@ -694,83 +687,35 @@ def main():
         elif of_dir:
             print(f"  Re={Re}: OF directory not found — {of_dir}")
 
-        # ── Optional benchmark reference ─────────────────────────────────
-        ref_u = REF_U_PROFILE.get(Re)
-        if ref_u is not None:
-            ax_u_y.plot(
-                ref_u[:, 1],
-                ref_u[:, 0],
-                "kx",
-                ms=5,
-                mew=1.3,
-                lw=0,
-                label="Reference",
-                zorder=4,
-            )
-
-        ref_ux = REF_UX_LINE.get(Re)
-        if ref_ux is not None:
-            ax_u_x.plot(
-                ref_ux[:, 0],
-                ref_ux[:, 1],
-                "kx",
-                ms=5,
-                mew=1.3,
-                lw=0,
-                label="Reference",
-                zorder=4,
-            )
-
-        # ── Geometry markers ─────────────────────────────────────────────
-        draw_step_geometry(ax_u_y, "vertical", x_fixed=X_PROBE)
-        draw_step_geometry(ax_u_x, "horizontal")
-
-        # ── Axes cosmetics ───────────────────────────────────────────────
-        ax_u_y.axvline(0, color="0.7", lw=0.7, ls=":")
-        ax_u_y.set_ylim(0, H_CHAN)
-        ax_u_y.set_title(f"Re = {int(Re)}", fontsize=11, pad=4)
-
-        ax_u_x.axhline(0, color="0.7", lw=0.7, ls=":")
-        ax_u_x.set_xlim(0, of_x_max + 0.5 if of_x_max is not None else x_max_re)
+        # ── Geometry & cosmetics ──────────────────────────────────────────
+        draw_step_geometry(ax, "horizontal")
+        ax.axhline(0, color="0.7", lw=0.7, ls=":")
+        ax.set_xlim(0, of_x_max + 0.5 if of_x_max is not None else x_max_re)
+        ax.set_title(f"Re = {int(Re)}", fontsize=11, pad=4)
+        ax.set_xlabel(f"$x/h$ at $y={Y_PROBE:.1f}h$", fontsize=10)
 
         text_lines = []
         if pinn_cross is not None:
-            text_lines.append(rf"PINN line $u=0$: {pinn_cross:.2f}")
+            text_lines.append(rf"PINN $u=0$: {pinn_cross:.2f}$h$")
         if of_cross is not None:
-            text_lines.append(rf"OF line $u=0$: {of_cross:.2f}")
+            text_lines.append(rf"OF $u=0$: {of_cross:.2f}$h$")
         if text_lines:
-            ax_u_x.text(
-                0.03,
-                0.97,
+            ax.text(
+                0.03, 0.97,
                 "\n".join(text_lines),
-                transform=ax_u_x.transAxes,
-                va="top",
-                ha="left",
-                fontsize=7.5,
+                transform=ax.transAxes,
+                va="top", ha="left", fontsize=7.5,
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.8", alpha=0.75),
             )
 
         if col == 0:
-            ax_u_y.set_ylabel(r"$y/h$", fontsize=10)
-            ax_u_x.set_ylabel(r"$u/U_{\mathrm{mean}}$", fontsize=10)
+            ax.set_ylabel(r"$u/U_{\mathrm{mean}}$", fontsize=10)
         else:
-            ax_u_y.tick_params(labelleft=False)
-            ax_u_x.tick_params(labelleft=False)
+            ax.tick_params(labelleft=False)
 
-        ax_u_y.legend(fontsize=8, frameon=False, loc="lower right")
-        ax_u_x.legend(fontsize=8, frameon=False, loc="lower right")
+        ax.legend(fontsize=8, frameon=False, loc="lower right")
 
-    for col in range(n_cols):
-        axes[0][col].set_xlabel(
-            f"$u/U_{{\\mathrm{{mean}}}}$ at $x={int(X_PROBE)}h$",
-            fontsize=10,
-        )
-        axes[1][col].set_xlabel(
-            f"$x/h$ at $y={Y_PROBE:.1f}h$",
-            fontsize=10,
-        )
-
-    fig.tight_layout(pad=1.2, h_pad=2.0, w_pad=1.0)
+    fig.tight_layout(pad=1.2, w_pad=1.0)
 
     for ext in ("pdf", "png"):
         out_path = os.path.join(OUT_DIR, f"backward_step_validation_corrected.{ext}")
@@ -787,23 +732,6 @@ def main():
     print("\nGenerating spatial error maps...")
     make_spatial_error_plots(OUT_DIR)
 
-    # ── SIREN field comparison (OF | PINN | error) ────────────────────────
-    print("\nGenerating SIREN field comparison plots...")
-    make_field_comparison_plots(
-        OUT_DIR,
-        pinn_results=SIREN_RESULTS,
-        label="siren",
-        model_loader=load_siren_model,
-    )
-
-    # ── SIREN spatial error maps ──────────────────────────────────────────
-    print("\nGenerating SIREN spatial error maps...")
-    make_spatial_error_plots(
-        OUT_DIR,
-        pinn_results=SIREN_RESULTS,
-        label="siren",
-        model_loader=load_siren_model,
-    )
 
 
 if __name__ == "__main__":
