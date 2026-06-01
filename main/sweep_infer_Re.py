@@ -312,8 +312,10 @@ def run_inference(Re_true, Re_init, x_obs, y_obs, u_obs, v_obs, seed=42, desc=""
                 pbar.set_postfix(Re=f"{Re_curr:.1f}", loss=f"{float(loss):.2e}")
             pbar.update(1)
 
-            # Re-stability early stopping
-            if epoch >= RE_STABLE_WINDOW and epoch % 20 == 0:
+            # Re-stability early stopping — but not before the collocation
+            # set has been resampled at least twice, so runs that settle on a
+            # pre-resample plateau get a chance to be jolted off it.
+            if epoch >= max(RE_STABLE_WINDOW, 2 * RESAMPLE_EVERY) and epoch % 20 == 0:
                 window = Re_history[-RE_STABLE_WINDOW:]
                 rel_std = np.std(window) / (np.mean(window) + 1e-12)
                 if rel_std < RE_STABLE_TOL:
