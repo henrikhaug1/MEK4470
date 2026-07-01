@@ -15,8 +15,11 @@ matplotlib.use("Agg")
 
 from src.pinn import (
     BackwardStepPINN,
+    FourierBackwardStepPINN,
+    load_fourier_model,
     eval_uvp_batch_bs_raw,
     residuals_batch_bs_raw,
+    residual_parts_bs_raw,
     inlet_profile_bs,
     sample_interior_bs,
     sample_walls_bs,
@@ -41,6 +44,8 @@ H_CHAN = 2.0
 U_MEAN = 1.0
 
 WIDTHS = [32, 32, 32]  # inference model (plain tanh, trained from scratch)
+FOURIER_WIDTHS = [128, 128, 128, 128]  # higher-capacity inference net (--net_arch fourier)
+N_FOURIER = 16
 
 # ============================================================
 # OpenFOAM case paths
@@ -194,6 +199,41 @@ def load_of_observations(Re_true, x_obs, y_obs):
     return u_interp, v_interp
 
 
+# Forward-model checkpoints (FourierBackwardStepPINN) trained at each Re.
+FORWARD_CKPTS = {
+    100: "results/backward_step_v2/Re100/params.npz",
+    200: "results/backward_step_v2/Re200/params.npz",
+    400: "results/backward_step_v2/Re400/params.npz",
+    800: "results/backward_step_v2/Re800/params.npz",
+}
+
+
+def load_synthetic_observations(Re_true, x_obs, y_obs):
+    """
+    Generate physics-consistent observations by evaluating the trained forward
+    PINN (FourierBackwardStepPINN) at Re_true on the observation points.
+
+    Unlike the OpenFOAM observations, these carry no finite-volume
+    discretisation / interpolation error, so the resulting inference error
+    measures the optimiser/inference floor rather than model-form mismatch.
+    The forward net is a different architecture (Fourier [128]x4) from the
+    inference net (plain tanh [32]x3), so this is not a trivial inverse crime.
+    """
+    ckpt = FORWARD_CKPTS.get(int(Re_true))
+    if ckpt is None:
+        raise ValueError(f"No forward checkpoint configured for Re={Re_true}")
+    if not os.path.isfile(ckpt):
+        raise FileNotFoundError(
+            f"Forward checkpoint not found: {ckpt}\n"
+            f"Expected at: {os.path.abspath(ckpt)}\n"
+            f"Train it first with main/train_backward_step_v2.py"
+        )
+
+    fwd = load_fourier_model(ckpt, key=jax.random.key(0), activation=jax.nn.tanh)
+    u, v, _ = eval_uvp_batch_bs_raw(fwd, x_obs, y_obs, X_MIN, X_MAX, H_CHAN)
+    return jnp.asarray(u), jnp.asarray(v)
+
+
 # ============================================================
 # loss  (soft-BC formulation matching forward training)
 # ============================================================
@@ -263,6 +303,174 @@ def make_loss_fn(x_col, y_col, x_in, y_in, x_wall, y_wall,
 
 
 # ============================================================
+# joint-phase drivers
+# ============================================================
+
+RESAMPLE_EVERY   = 1000
+RE_STABLE_WINDOW = 200
+RE_STABLE_TOL    = 0.005
+PATIENCE_WINDOW  = 500
+
+
+def run_free(model, log_Re, args, x_col, y_col, x_in, y_in, x_wall, y_wall,
+             x_obs, y_obs, u_obs, v_obs, Re_history, loss_history):
+    """Original mode: Re is a free optimiser variable (biased — drifts high)."""
+    net_schedule = optax.cosine_decay_schedule(args.net_lr, args.epochs, alpha=1e-2)
+    re_schedule  = optax.cosine_decay_schedule(args.re_lr,  args.epochs, alpha=1e-2)
+    net_opt = nnx.Optimizer(model, optax.adam(learning_rate=net_schedule), wrt=nnx.Param)
+    re_optimizer = optax.adam(learning_rate=re_schedule)
+    re_state = re_optimizer.init(log_Re)
+
+    loss_fn = make_loss_fn(
+        x_col, y_col, x_in, y_in, x_wall, y_wall,
+        x_obs, y_obs, u_obs, v_obs, w_data=args.w_data,
+    )
+    freeze_net = args.freeze_net
+
+    @nnx.jit
+    def train_step(model, net_opt, log_Re, re_state):
+        loss, net_grads = nnx.value_and_grad(lambda m: loss_fn(m, log_Re))(model)
+        re_grad = jax.grad(lambda lr: loss_fn(model, lr))(log_Re)
+        if not freeze_net:
+            net_opt.update(model, net_grads)
+        re_updates, new_re_state = re_optimizer.update(re_grad, re_state)
+        new_log_Re = optax.apply_updates(log_Re, re_updates)
+        return new_log_Re, new_re_state, loss
+
+    print("Starting joint inference (free Re)...\n")
+    k_col = jax.random.key(123)
+    with tqdm(total=args.epochs, desc="Infer Re", unit="epoch", dynamic_ncols=True) as pbar:
+        for epoch in range(args.epochs):
+            log_Re, re_state, loss = train_step(model, net_opt, log_Re, re_state)
+            Re_current = float(jnp.exp(log_Re))
+            Re_history.append(Re_current)
+            loss_history.append(float(loss))
+            if epoch % 20 == 0:
+                pbar.set_postfix(loss=f"{float(loss):.3e}", Re=f"{Re_current:.1f}")
+            pbar.update(1)
+
+            if not args.no_early_stop and epoch >= RE_STABLE_WINDOW and epoch % 20 == 0:
+                window = Re_history[-RE_STABLE_WINDOW:]
+                rel_std = np.std(window) / (np.mean(window) + 1e-12)
+                if rel_std < RE_STABLE_TOL:
+                    pbar.write(f"Re converged at epoch {epoch} "
+                               f"(Re={Re_current:.2f}, rel_std={rel_std:.4f})")
+                    break
+
+            if not args.no_early_stop and epoch > args.epochs // 2 and epoch % 100 == 0:
+                if len(loss_history) >= 2 * PATIENCE_WINDOW:
+                    recent = np.mean(loss_history[-PATIENCE_WINDOW:])
+                    older  = np.mean(loss_history[-2 * PATIENCE_WINDOW: -PATIENCE_WINDOW])
+                    if abs(recent - older) / (abs(older) + 1e-12) < 5e-4:
+                        pbar.write(f"Early stopping at epoch {epoch} (loss plateau)")
+                        break
+    return Re_history[-1]
+
+
+def run_closed_form(model, args, x_col, y_col, x_in, y_in, x_wall, y_wall,
+                    x_obs, y_obs, u_obs, v_obs, Re_history, loss_history):
+    """Sturdy mode: Re is slaved to the field's least-squares viscous balance.
+
+    Re is NOT a free optimiser variable. Each step we read off the optimal
+    viscosity from the current field,
+        nu* = Σ(a·b) / Σ(b·b),   a = u·∇u + ∇p,  b = ∇²u,
+    EMA-smooth it, and train only the network on data + physics-at-nu. The
+    network cannot lower the residual by inflating Re (that knob is gone), so
+    the runaway/upward-drift failure mode is structurally eliminated; spurious
+    curvature is penalised rather than rewarded.
+    """
+    net_schedule = optax.cosine_decay_schedule(args.net_lr, args.epochs, alpha=1e-2)
+    net_opt = nnx.Optimizer(model, optax.adam(learning_rate=net_schedule), wrt=nnx.Param)
+    u_inlet_ref = inlet_profile_bs(y_in, H_STEP, H_CHAN, U_MEAN)
+
+    NU_MIN, NU_MAX = 1.0 / 1e5, 1.0          # Re in [1, 1e5]
+    beta = args.re_ema
+
+    # Hold out a validation subset of the observations. Re passes through the
+    # truth when the field generalises best; continued training then overfits
+    # the (noisy, interpolated) observations, adding spurious curvature that
+    # biases nu*. Validation-based selection picks the field at best
+    # generalisation instead of relying on a lucky early stop.
+    n_val = max(1, len(x_obs) // 5)
+    xv, yv, uv, vv = x_obs[:n_val], y_obs[:n_val], u_obs[:n_val], v_obs[:n_val]
+    xt, yt, ut, vt = x_obs[n_val:], y_obs[n_val:], u_obs[n_val:], v_obs[n_val:]
+
+    def cf_loss(m, nu_use):
+        cont, a_x, b_x, a_y, b_y = residual_parts_bs_raw(
+            m, x_col, y_col, X_MIN, X_MAX, H_CHAN
+        )
+        mom_x = a_x - nu_use * b_x
+        mom_y = a_y - nu_use * b_y
+        phys = jnp.mean(cont**2) + jnp.mean(mom_x**2) + jnp.mean(mom_y**2)
+
+        num = jnp.sum(a_x * b_x + a_y * b_y)
+        den = jnp.sum(b_x**2 + b_y**2) + 1e-12
+        nu_star = num / den
+
+        u_pred, v_pred, _ = eval_uvp_batch_bs_raw(m, xt, yt, X_MIN, X_MAX, H_CHAN)
+        data = jnp.mean((u_pred - ut) ** 2) + jnp.mean((v_pred - vt) ** 2)
+        u_i, v_i, _ = eval_uvp_batch_bs_raw(m, x_in, y_in, X_MIN, X_MAX, H_CHAN)
+        bc_inlet = jnp.mean((u_i - u_inlet_ref) ** 2) + jnp.mean(v_i**2)
+        u_w, v_w, _ = eval_uvp_batch_bs_raw(m, x_wall, y_wall, X_MIN, X_MAX, H_CHAN)
+        bc_walls = jnp.mean(u_w**2 + v_w**2)
+
+        loss = (W_PHYS * phys + args.w_data * W_DATA * data
+                + W_INLET * bc_inlet + W_WALLS * bc_walls)
+        return loss, jax.lax.stop_gradient(nu_star)
+
+    @nnx.jit
+    def cf_step(model, net_opt, nu_use):
+        (loss, nu_star), grads = nnx.value_and_grad(cf_loss, has_aux=True)(model, nu_use)
+        net_opt.update(model, grads)
+        return loss, nu_star
+
+    @nnx.jit
+    def val_mse(m):
+        u_p, v_p, _ = eval_uvp_batch_bs_raw(m, xv, yv, X_MIN, X_MAX, H_CHAN)
+        return jnp.mean((u_p - uv) ** 2) + jnp.mean((v_p - vv) ** 2)
+
+    # Initialise the EMA viscosity from the warmed-up field.
+    _, nu0 = cf_loss(model, jnp.asarray(1.0 / args.Re_init))
+    nu_ema = float(np.clip(float(nu0), NU_MIN, NU_MAX))
+    print(f"Starting closed-form Re inference  (initial nu*={nu_ema:.4e} -> "
+          f"Re={1.0 / nu_ema:.1f})\n")
+
+    best_val = np.inf
+    Re_at_best = 1.0 / nu_ema
+    best_epoch = 0
+    VAL_EVERY = 20
+    VAL_PATIENCE = 40  # checks (= VAL_PATIENCE*VAL_EVERY epochs) without val improvement
+
+    with tqdm(total=args.epochs, desc="Infer Re (closed-form)", unit="epoch",
+              dynamic_ncols=True) as pbar:
+        for epoch in range(args.epochs):
+            loss, nu_star = cf_step(model, net_opt, jnp.asarray(nu_ema))
+            nu_star = float(np.clip(float(nu_star), NU_MIN, NU_MAX))
+            nu_ema = beta * nu_ema + (1.0 - beta) * nu_star
+            Re_current = 1.0 / nu_ema
+            Re_history.append(Re_current)
+            loss_history.append(float(loss))
+
+            if epoch % VAL_EVERY == 0:
+                vm = float(val_mse(model))
+                if vm < best_val:
+                    best_val, Re_at_best, best_epoch = vm, Re_current, epoch
+                pbar.set_postfix(loss=f"{float(loss):.3e}", Re=f"{Re_current:.1f}",
+                                 val=f"{vm:.2e}", Re_best=f"{Re_at_best:.1f}")
+                # Stop once validation has stopped improving (overfitting begun).
+                if (not args.no_early_stop
+                        and epoch - best_epoch >= VAL_PATIENCE * VAL_EVERY):
+                    pbar.write(f"Val-based stop at epoch {epoch}  "
+                               f"(best val @ {best_epoch}, Re={Re_at_best:.2f})")
+                    break
+            pbar.update(1)
+
+    print(f"  Best validation field at epoch {best_epoch}: "
+          f"val_mse={best_val:.3e}  ->  Re={Re_at_best:.2f}")
+    return Re_at_best
+
+
+# ============================================================
 # main
 # ============================================================
 
@@ -283,13 +491,68 @@ if __name__ == "__main__":
     parser.add_argument("--n_obs", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=8000,
                         help="Joint-phase epochs (after warm-up)")
+    parser.add_argument("--warmup_epochs", type=int, default=WARMUP_EPOCHS,
+                        help="Data+BC warm-up epochs (network fit before Re phase)")
     parser.add_argument("--net_lr", type=float, default=1e-3)
     parser.add_argument("--re_lr", type=float, default=1e-2)
     parser.add_argument("--w_data", type=float, default=1000.0)
+    parser.add_argument(
+        "--obs_source",
+        choices=["openfoam", "synthetic"],
+        default="openfoam",
+        help="openfoam: interpolate OpenFOAM field as observations (default). "
+             "synthetic: evaluate the trained forward PINN at Re_true "
+             "(no FV model-form error — measures the inference floor).",
+    )
+    parser.add_argument(
+        "--re_mode",
+        choices=["free", "closed_form"],
+        default="closed_form",
+        help="free: Re is a free optimiser variable driven by the physics residual "
+             "(biased — drifts high). closed_form (default, sturdy): Re is slaved to "
+             "the field's least-squares viscous balance nu*=sum(a.b)/sum(b.b), removing "
+             "the runaway degree of freedom.",
+    )
+    parser.add_argument(
+        "--re_ema",
+        type=float,
+        default=0.99,
+        help="EMA smoothing for the closed-form viscosity (closer to 1 = smoother).",
+    )
+    parser.add_argument(
+        "--net_arch",
+        choices=["tanh", "fourier"],
+        default="tanh",
+        help="Inference network architecture. fourier = higher-capacity Fourier-feature "
+             "net that represents sharp gradients better, reducing the over-smoothing "
+             "that biases Re high.",
+    )
+    parser.add_argument(
+        "--freeze_net",
+        action="store_true",
+        help="After the data+BC warm-up, freeze the network and optimise ONLY log_Re. "
+             "A fixed (sharp) field cannot over-smooth to chase the physics residual, "
+             "so this avoids the upward Re drift seen in joint training.",
+    )
+    parser.add_argument(
+        "--no_early_stop",
+        action="store_true",
+        help="Disable Re-stability/plateau early stopping (run full epoch budget). "
+             "Diagnostic: reveals whether Re drifts after the apparent plateau.",
+    )
     args = parser.parse_args()
 
-    RESULTS_DIR = "results/infer_Re"
-    PLOTS_DIR = "plots/infer_Re"
+    suffix = ""
+    if args.re_mode == "free":
+        suffix += "_free"
+    if args.obs_source == "synthetic":
+        suffix += "_synthetic"
+    if args.net_arch == "fourier":
+        suffix += "_fourier"
+    if args.freeze_net:
+        suffix += "_frozen"
+    RESULTS_DIR = f"results/infer_Re{suffix}"
+    PLOTS_DIR = f"plots/infer_Re{suffix}"
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(PLOTS_DIR, exist_ok=True)
 
@@ -303,10 +566,16 @@ if __name__ == "__main__":
     x_obs = x_cand[valid][: args.n_obs]
     y_obs = y_cand[valid][: args.n_obs]
 
-    # ---- load OpenFOAM observations ----
-    print(f"\nLoading OpenFOAM Re={args.Re_true} observations from {OF_CASES[int(args.Re_true)]}")
-    u_obs, v_obs = load_of_observations(args.Re_true, x_obs, y_obs)
-    print(f"  Generated {len(x_obs)} observation points from OpenFOAM Re={args.Re_true}")
+    # ---- load observations (OpenFOAM field, or synthetic from forward PINN) ----
+    if args.obs_source == "synthetic":
+        print(f"\nGenerating synthetic Re={args.Re_true} observations from forward PINN "
+              f"{FORWARD_CKPTS[int(args.Re_true)]}")
+        u_obs, v_obs = load_synthetic_observations(args.Re_true, x_obs, y_obs)
+        print(f"  Generated {len(x_obs)} synthetic observation points (no FV model-form error)")
+    else:
+        print(f"\nLoading OpenFOAM Re={args.Re_true} observations from {OF_CASES[int(args.Re_true)]}")
+        u_obs, v_obs = load_of_observations(args.Re_true, x_obs, y_obs)
+        print(f"  Generated {len(x_obs)} observation points from OpenFOAM Re={args.Re_true}")
     print(f"  u_obs: min={float(u_obs.min()):.3f}  max={float(u_obs.max()):.3f}  "
           f"mean={float(u_obs.mean()):.3f}")
     print(f"  v_obs: min={float(v_obs.min()):.3f}  max={float(v_obs.max()):.3f}  "
@@ -318,12 +587,22 @@ if __name__ == "__main__":
 
     # ---- create inference model (random init) ----
     key = jax.random.key(42)
-    model = BackwardStepPINN(
-        widths=WIDTHS,
-        key=key,
-        activation=jax.nn.tanh,
-        n_inputs=2,
-    )
+    if args.net_arch == "fourier":
+        model = FourierBackwardStepPINN(
+            widths=FOURIER_WIDTHS,
+            key=key,
+            activation=jax.nn.tanh,
+            n_inputs=2,
+            n_fourier=N_FOURIER,
+        )
+        print(f"  Inference net: Fourier features (n_fourier={N_FOURIER}), widths={FOURIER_WIDTHS}")
+    else:
+        model = BackwardStepPINN(
+            widths=WIDTHS,
+            key=key,
+            activation=jax.nn.tanh,
+            n_inputs=2,
+        )
 
     log_Re = jnp.array(float(np.log(args.Re_init)))
 
@@ -352,7 +631,7 @@ if __name__ == "__main__":
     # After warm-up, the physics gradient on Re is informative (it sees a
     # realistic flow field) instead of chasing random network noise.
     wu_schedule = optax.cosine_decay_schedule(
-        init_value=args.net_lr, decay_steps=WARMUP_EPOCHS, alpha=1e-2
+        init_value=args.net_lr, decay_steps=args.warmup_epochs, alpha=1e-2
     )
     wu_opt = nnx.Optimizer(model, optax.adam(learning_rate=wu_schedule), wrt=nnx.Param)
 
@@ -363,13 +642,13 @@ if __name__ == "__main__":
         return loss
 
     print(f"  net_lr = {args.net_lr:.1e}   re_lr = {args.re_lr:.1e}")
-    print(f"  warm-up epochs = {WARMUP_EPOCHS}   joint epochs = {args.epochs}\n")
+    print(f"  warm-up epochs = {args.warmup_epochs}   joint epochs = {args.epochs}\n")
     t0 = time.perf_counter()
 
     with tqdm(
-        total=WARMUP_EPOCHS, desc="Warm-up (data+BC)", unit="epoch", dynamic_ncols=True
+        total=args.warmup_epochs, desc="Warm-up (data+BC)", unit="epoch", dynamic_ncols=True
     ) as pbar:
-        for epoch in range(WARMUP_EPOCHS):
+        for epoch in range(args.warmup_epochs):
             wu_loss = warmup_step(model, wu_opt)
             if epoch % 20 == 0:
                 pbar.set_postfix(loss=f"{float(wu_loss):.3e}")
@@ -378,99 +657,21 @@ if __name__ == "__main__":
     print(f"  Warm-up done. Data loss ≈ {float(wu_loss):.3e}")
     print(f"  Re still at init = {float(jnp.exp(log_Re)):.1f}\n")
 
-    # ---- Phase 2: joint optimisation ----
-    # Now both network weights and Re are updated.
-    # Fresh optimiser for the joint phase so the cosine schedule restarts.
-    net_schedule = optax.cosine_decay_schedule(
-        init_value=args.net_lr, decay_steps=args.epochs, alpha=1e-2
-    )
-    re_schedule = optax.cosine_decay_schedule(
-        init_value=args.re_lr, decay_steps=args.epochs, alpha=1e-2
-    )
-    net_opt = nnx.Optimizer(model, optax.adam(learning_rate=net_schedule), wrt=nnx.Param)
-    re_optimizer = optax.adam(learning_rate=re_schedule)
-    re_state = re_optimizer.init(log_Re)
-
-    # Build the full physics+data+BC loss over initial collocation points
-    loss_fn = make_loss_fn(
-        x_col, y_col, x_in, y_in, x_wall, y_wall,
-        x_obs, y_obs, u_obs, v_obs,
-        w_data=args.w_data,
-    )
-
-    @nnx.jit
-    def train_step(model, net_opt, log_Re, re_state):
-        # Network gradient: full loss (physics + data + BCs)
-        loss, net_grads = nnx.value_and_grad(lambda m: loss_fn(m, log_Re))(model)
-        # Re gradient: full loss (physics provides the Re-sensitive signal now
-        # that the network already encodes a realistic flow from warm-up)
-        re_grad = jax.grad(lambda lr: loss_fn(model, lr))(log_Re)
-        net_opt.update(model, net_grads)
-        re_updates, new_re_state = re_optimizer.update(re_grad, re_state)
-        new_log_Re = optax.apply_updates(log_Re, re_updates)
-        return new_log_Re, new_re_state, loss
-
     Re_history = []
     loss_history = []
-    PATIENCE_WINDOW = 500
-    RESAMPLE_EVERY  = 1000
-    RE_STABLE_WINDOW = 200
-    RE_STABLE_TOL    = 0.005
 
-    print("Starting joint inference training...\n")
-
-    k_col = k1
-
-    with tqdm(
-        total=args.epochs, desc="Infer Re", unit="epoch", dynamic_ncols=True
-    ) as pbar:
-        for epoch in range(args.epochs):
-            log_Re, re_state, loss = train_step(model, net_opt, log_Re, re_state)
-            Re_current = float(jnp.exp(log_Re))
-            Re_history.append(Re_current)
-            loss_history.append(float(loss))
-
-            if epoch % 20 == 0:
-                pbar.set_postfix(loss=f"{float(loss):.3e}", Re=f"{Re_current:.1f}")
-            pbar.update(1)
-
-            # Re-stability early stopping: if Re has settled, stop before overshoot
-            if epoch >= RE_STABLE_WINDOW and epoch % 20 == 0:
-                window = Re_history[-RE_STABLE_WINDOW:]
-                rel_std = np.std(window) / (np.mean(window) + 1e-12)
-                if rel_std < RE_STABLE_TOL:
-                    pbar.write(
-                        f"Re converged at epoch {epoch}  "
-                        f"(Re={Re_current:.2f}, rel_std={rel_std:.4f})"
-                    )
-                    break
-
-            # resample interior collocation points periodically
-            if epoch > 0 and epoch % RESAMPLE_EVERY == 0:
-                k_col = jax.random.fold_in(k_col, epoch)
-                x_col, y_col = sample_interior_bs(
-                    k_col, 12000, X_MIN, X_MAX, H_STEP, H_CHAN
-                )
-                loss_fn = make_loss_fn(
-                    x_col, y_col, x_in, y_in, x_wall, y_wall,
-                    x_obs, y_obs, u_obs, v_obs,
-                    w_data=args.w_data,
-                )
-                pbar.write(f"  [resample {epoch}] new collocation points")
-
-            # loss-plateau early stopping (only after half the budget)
-            if epoch > args.epochs // 2 and epoch % 100 == 0:
-                if len(loss_history) >= 2 * PATIENCE_WINDOW:
-                    recent = np.mean(loss_history[-PATIENCE_WINDOW:])
-                    older = np.mean(
-                        loss_history[-2 * PATIENCE_WINDOW : -PATIENCE_WINDOW]
-                    )
-                    if abs(recent - older) / (abs(older) + 1e-12) < 5e-4:
-                        pbar.write(f"Early stopping at epoch {epoch} (loss plateau)")
-                        break
+    if args.re_mode == "closed_form":
+        Re_final = run_closed_form(
+            model, args, x_col, y_col, x_in, y_in, x_wall, y_wall,
+            x_obs, y_obs, u_obs, v_obs, Re_history, loss_history,
+        )
+    else:
+        Re_final = run_free(
+            model, log_Re, args, x_col, y_col, x_in, y_in, x_wall, y_wall,
+            x_obs, y_obs, u_obs, v_obs, Re_history, loss_history,
+        )
 
     elapsed = time.perf_counter() - t0
-    Re_final = Re_history[-1]
     print(f"\nDone in {elapsed:.1f} s")
     print(
         f"Re_true = {args.Re_true:.1f}   Re_init = {args.Re_init:.1f}   Re_final = {Re_final:.2f}"
@@ -489,7 +690,8 @@ if __name__ == "__main__":
         f.write(f"w_data   = {args.w_data}\n")
         f.write(f"epochs   = {args.epochs}\n")
         f.write(f"elapsed_s= {elapsed:.1f}\n")
-        f.write(f"obs_src  = OpenFOAM\n")
+        f.write(f"obs_src  = {args.obs_source}\n")
+        f.write(f"re_mode  = {args.re_mode}\n")
 
     # ---- plots ----
     plot_Re_convergence(Re_history, args.Re_true, PLOTS_DIR)

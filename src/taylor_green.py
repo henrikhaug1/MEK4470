@@ -55,6 +55,51 @@ def residuals_batch(model, Re, x, y, t, t_max):
     return jax.vmap(residual_single)(xyt_batch)
 
 
+def residual_parts(model, x, y, t, t_max):
+    """Split the Taylor-Green momentum residual into Re-independent and viscous parts.
+
+    Returns (cont, a_x, b_x, a_y, b_y) where, per momentum component,
+        mom = a - nu * b,   nu = 1/Re,
+    with
+        a = u_t + u·∇u + ∇p   (unsteady + inertial + pressure, Re-independent)
+        b = ∇²u               (Laplacian; viscous term is nu·b)
+
+    The optimal viscosity is then the least-squares projection
+        nu* = Σ(a·b)/Σ(b·b)   ->   Re = 1/nu*.
+    """
+    ex = jnp.array([1.0, 0.0, 0.0])
+    ey = jnp.array([0.0, 1.0, 0.0])
+    et = jnp.array([0.0, 0.0, 1.0])
+    xyt_batch = jnp.stack([x, y, t], axis=-1)
+
+    def single(xyt):
+        def net_physical(z):
+            return _net_tg_physical(model, z, t_max)
+
+        out, d_x = jax.jvp(net_physical, (xyt,), (ex,))
+        _, d_y = jax.jvp(net_physical, (xyt,), (ey,))
+        _, d_t = jax.jvp(net_physical, (xyt,), (et,))
+
+        u, v, p = out[0], out[1], out[2]
+        ux, vx, px = d_x[0], d_x[1], d_x[2]
+        uy, vy, py = d_y[0], d_y[1], d_y[2]
+        ut, vt = d_t[0], d_t[1]
+
+        _, d_xx = jax.jvp(lambda z: jax.jvp(net_physical, (z,), (ex,))[1], (xyt,), (ex,))
+        _, d_yy = jax.jvp(lambda z: jax.jvp(net_physical, (z,), (ey,))[1], (xyt,), (ey,))
+        u_xx, v_xx = d_xx[0], d_xx[1]
+        u_yy, v_yy = d_yy[0], d_yy[1]
+
+        cont = ux + vy
+        a_x = ut + u * ux + v * uy + px
+        b_x = u_xx + u_yy
+        a_y = vt + u * vx + v * vy + py
+        b_y = v_xx + v_yy
+        return cont, a_x, b_x, a_y, b_y
+
+    return jax.vmap(single)(xyt_batch)
+
+
 # =========================================================
 # evaluation
 # =========================================================

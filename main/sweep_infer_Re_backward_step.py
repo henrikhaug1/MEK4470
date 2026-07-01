@@ -437,7 +437,22 @@ def main():
 
     axes[0].axhline(10, color="0.6", lw=0.8, ls="--", label="10 % threshold")
     axes[0].set_xscale("log")
-    axes[0].set_xlabel(r"$\mathrm{Re}_{\mathrm{init}}\,/\,\mathrm{Re}_{\mathrm{true}}$", fontsize=11)
+    # Explicit ticks at the sweep factors so the actual initialisation ratio is readable
+    tick_labels = {
+        0.125: "1/8", 0.25: "1/4", 0.5: "1/2",
+        1.0: "1", 2.0: "2", 4.0: "4", 8.0: "8",
+    }
+    ticks = sorted(set(RE_INIT_FACTORS) | {1.0})
+    axes[0].set_xticks(ticks)
+    axes[0].set_xticklabels(
+        [tick_labels.get(t, f"{t:g}") for t in ticks], fontsize=9
+    )
+    axes[0].minorticks_off()
+    axes[0].set_xlabel(
+        r"$\mathrm{Re}_{\mathrm{init}}\,/\,\mathrm{Re}_{\mathrm{true}}$"
+        "   (initialisation ratio)",
+        fontsize=11,
+    )
     axes[0].set_ylabel("Relative error  (%)", fontsize=11)
     axes[0].set_title("Inference error vs initialisation ratio", fontsize=11)
     axes[0].axvline(1, color="0.7", lw=0.7, ls=":")
@@ -448,16 +463,16 @@ def main():
     all_Re_final = [r["Re_final"] for r in results]
     all_factors  = [r["factor"]   for r in results]
 
-    sc = axes[1].scatter(
-        all_Re_true, all_Re_final,
-        c=np.log10(all_factors),
-        cmap="RdYlGn_r",
-        s=60, zorder=3, edgecolors="0.3", linewidths=0.5,
-    )
-    cb = fig.colorbar(sc, ax=axes[1], pad=0.02)
-    cb.set_label(
-        r"$\log_{10}(\mathrm{Re}_{\mathrm{init}}\,/\,\mathrm{Re}_{\mathrm{true}})$",
-        fontsize=9, rotation=270, labelpad=14, va="bottom",
+    # Spread the 6 init-factor runs horizontally within each Re_true column so
+    # the (otherwise overlapping) markers are all distinguishable. The jitter is
+    # proportional to log10(Re_init/Re_true) and ±4 % of Re_true wide.
+    x_jit = [rt * (1.0 + 0.045 * np.log10(f))
+             for rt, f in zip(all_Re_true, all_factors)]
+
+    axes[1].scatter(
+        x_jit, all_Re_final,
+        color="black",
+        s=14, zorder=3, edgecolors="0.3", linewidths=0.4,
     )
 
     lo = min(all_Re_true) * 0.8

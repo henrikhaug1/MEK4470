@@ -1,9 +1,10 @@
-Re_true  = 400.0
+Re_true  = 200.0
 Re_init  = 800.0
-Re_final = 446.8968
-error_%  = 11.72
+Re_final = 234.7770
+error_%  = 17.39
 n_obs    = 500
 w_data   = 1000.0
-epochs   = 5000
-elapsed_s= 34.4
-obs_src  = OpenFOAM
+epochs   = 6000
+elapsed_s= 179.9
+obs_src  = openfoam
+re_mode  = closed_form

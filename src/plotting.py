@@ -365,6 +365,21 @@ def plot_spatial_error_map(
     print(f"  saved {path}")
 
 
+def _vortex_centre_from_u(u, x1d, y1d):
+    """Primary-vortex centre = argmin of the streamfunction psi = ∫ u dy.
+
+    NaNs (outer wall ring where griddata cannot extrapolate) are filled with
+    0 so the cumulative integral does not propagate them up the column.
+    """
+    u = np.nan_to_num(np.asarray(u), nan=0.0)
+    dy = float(y1d[1] - y1d[0])
+    psi = np.zeros_like(u)
+    for j in range(1, len(y1d)):
+        psi[j, :] = psi[j - 1, :] + 0.5 * (u[j - 1, :] + u[j, :]) * dy
+    iy, ix = np.unravel_index(np.nanargmin(psi), psi.shape)
+    return float(x1d[ix]), float(y1d[iy])
+
+
 def plot_lid_cavity_comparison(
     X, Y,
     u_of, v_of, p_of,
@@ -375,6 +390,7 @@ def plot_lid_cavity_comparison(
 ):
     """3×3 comparison plot: OpenFOAM | PINN | absolute error  for u, v, p.
     Adapted for the square lid-driven cavity domain (no step geometry).
+    The u-row is overlaid with the primary-vortex centre from both solvers.
     """
     fields = [
         (u_of, u_pinn, r"$u$"),
@@ -382,6 +398,13 @@ def plot_lid_cavity_comparison(
         (p_of, p_pinn, r"$p$"),
     ]
     col_titles = ["OpenFOAM (reference)", "PINN (predicted)", "Absolute error"]
+
+    # ── primary-vortex centres (same streamfunction method for both) ──
+    x1d = np.asarray(X)[0, :]
+    y1d = np.asarray(Y)[:, 0]
+    xv_of, yv_of = _vortex_centre_from_u(u_of, x1d, y1d)
+    xv_pn, yv_pn = _vortex_centre_from_u(u_pinn, x1d, y1d)
+    vortex_dist = float(np.hypot((xv_pn - xv_of) / 2.0, (yv_pn - yv_of) / 2.0))
 
     fig, axes = plt.subplots(3, 3, figsize=(13, 8))
 
@@ -416,8 +439,19 @@ def plot_lid_cavity_comparison(
             if row == 0:
                 ax.set_title(col_titles[col], fontsize=10)
 
+            # overlay primary-vortex centres on the u-row field panels
+            if row == 0 and col < 2:
+                ax.plot(xv_of, yv_of, "o", mfc="none", mec="#39FF14",
+                        mew=2.2, ms=13, label="OF vortex", zorder=5)
+                ax.plot(xv_pn, yv_pn, "x", color="magenta",
+                        mew=2.5, ms=11, label="PINN vortex", zorder=6)
+                if col == 0:
+                    ax.legend(loc="lower left", fontsize=7, framealpha=0.85,
+                              handletextpad=0.4, borderpad=0.3)
+
     fig.suptitle(
-        rf"Lid-driven cavity  —  Re = {Re:.0f}   (PINN vs. OpenFOAM)",
+        rf"Lid-driven cavity  —  Re = {Re:.0f}   (PINN vs. OpenFOAM)"
+        rf"     vortex-centre $\Delta$ = {vortex_dist:.3f}",
         fontsize=12, y=1.01,
     )
     fig.tight_layout()

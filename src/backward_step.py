@@ -160,6 +160,50 @@ def residuals_batch_bs_raw(model, Re, x, y, x_min, x_max, H):
     return jax.vmap(residual_single)(xy_batch)
 
 
+def residual_parts_bs_raw(model, x, y, x_min, x_max, H):
+    """Split the momentum residual into its Re-independent and viscous parts.
+
+    Returns (cont, a_x, b_x, a_y, b_y) where, per momentum component,
+        mom = a - (1/Re) * b
+    with
+        a = u·∇u + ∇p   (inertial + pressure, independent of Re)
+        b = ∇²u         (Laplacian; the viscous term is (1/Re)·b)
+
+    This lets the optimal viscosity be read off in closed form as a
+    least-squares projection  ν* = Σ(a·b)/Σ(b·b)  instead of being a free
+    parameter that can run away by suppressing the viscous term.
+    """
+    ex = jnp.array([1.0, 0.0])
+    ey = jnp.array([0.0, 1.0])
+    xy_batch = jnp.stack([x, y], axis=-1)
+
+    def single(xy):
+        def net_fn(z):
+            x_n, y_n = normalize_xy(z[0], z[1], x_min, x_max, H)
+            return model(jnp.stack([x_n, y_n])[None])[0]
+
+        out, d_x = jax.jvp(net_fn, (xy,), (ex,))
+        _, d_y = jax.jvp(net_fn, (xy,), (ey,))
+
+        u, v, p = out[0], out[1], out[2]
+        ux, vx, px = d_x[0], d_x[1], d_x[2]
+        uy, vy, py = d_y[0], d_y[1], d_y[2]
+
+        _, d_xx = jax.jvp(lambda z: jax.jvp(net_fn, (z,), (ex,))[1], (xy,), (ex,))
+        _, d_yy = jax.jvp(lambda z: jax.jvp(net_fn, (z,), (ey,))[1], (xy,), (ey,))
+        u_xx, v_xx = d_xx[0], d_xx[1]
+        u_yy, v_yy = d_yy[0], d_yy[1]
+
+        cont = ux + vy
+        a_x = u * ux + v * uy + px
+        b_x = u_xx + u_yy
+        a_y = u * vx + v * vy + py
+        b_y = v_xx + v_yy
+        return cont, a_x, b_x, a_y, b_y
+
+    return jax.vmap(single)(xy_batch)
+
+
 # =========================================================
 # samplers
 # =========================================================
